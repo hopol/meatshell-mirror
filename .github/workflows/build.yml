@@ -1,0 +1,214 @@
+name: 构建客户端
+
+on:
+  workflow_run:
+    workflows: ["同步上游仓库"]
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '上游版本标签（如 v0.6.3）'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      upstream_version: ${{ steps.check.outputs.upstream_version }}
+      mirror_tag: ${{ steps.check.outputs.mirror_tag }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 检查是否需要构建
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # 手动触发，使用输入的版本
+            UPSTREAM_VERSION="${{ github.event.inputs.version }}"
+            echo "upstream_version=$UPSTREAM_VERSION" >> $GITHUB_OUTPUT
+            echo "mirror_tag=mirror-${UPSTREAM_VERSION}-manual" >> $GITHUB_OUTPUT
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          else
+            # 由同步工作流触发，检查最新版本
+            if [ -f "upstream/.sync-info" ]; then
+              UPSTREAM_VERSION=$(grep "上游版本:" upstream/.sync-info | cut -d' ' -f2)
+              UPSTREAM_COMMIT=$(grep -m1 "" upstream/.sync-info | cut -d' ' -f1)
+              echo "upstream_version=$UPSTREAM_VERSION" >> $GITHUB_OUTPUT
+              echo "mirror_tag=mirror-${UPSTREAM_VERSION}-${UPSTREAM_COMMIT}" >> $GITHUB_OUTPUT
+              echo "should_build=true" >> $GITHUB_OUTPUT
+            else
+              echo "should_build=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: windows-x86_64
+            bin: meatshell.exe
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            name: linux-x86_64
+            bin: meatshell
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            name: linux-aarch64
+            bin: meatshell
+          - os: macos-14
+            target: aarch64-apple-darwin
+            name: macos-aarch64
+            bin: meatshell
+          - os: macos-14
+            target: x86_64-apple-darwin
+            name: macos-x86_64
+            bin: meatshell
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Linux GUI 依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake \
+            libfontconfig1-dev libfreetype6-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libgtk-3-dev \
+            libudev-dev
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 缓存 Cargo 构建
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: 构建 (release)
+        run: cargo build --release --target ${{ matrix.target }}
+        working-directory: upstream
+
+      - name: 打包
+        shell: bash
+        run: |
+          set -eu
+          VERSION="${{ needs.check.outputs.upstream_version }}"
+          STAGE="meatshell-${VERSION}-${{ matrix.name }}"
+
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            # 构建 .app bundle
+            APP="meatshell.app"
+            CONTENTS="$APP/Contents"
+            mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources"
+
+            cp "upstream/target/${{ matrix.target }}/release/meatshell" "$CONTENTS/MacOS/"
+            cp upstream/THIRD_PARTY_NOTICES.md "$CONTENTS/Resources/" 2>/dev/null || true
+
+            # 生成 .icns
+            mkdir -p meatshell.iconset
+            sips -z 16  16  "upstream/assets/icon@512.png" --out meatshell.iconset/icon_16x16.png       >/dev/null
+            sips -z 32  32  "upstream/assets/icon@512.png" --out meatshell.iconset/icon_16x16@2x.png    >/dev/null
+            sips -z 32  32  "upstream/assets/icon@512.png" --out meatshell.iconset/icon_32x32.png        >/dev/null
+            sips -z 64  64  "upstream/assets/icon@512.png" --out meatshell.iconset/icon_32x32@2x.png    >/dev/null
+            sips -z 128 128 "upstream/assets/icon@512.png" --out meatshell.iconset/icon_128x128.png     >/dev/null
+            sips -z 256 256 "upstream/assets/icon@512.png" --out meatshell.iconset/icon_128x128@2x.png  >/dev/null
+            sips -z 256 256 "upstream/assets/icon@512.png" --out meatshell.iconset/icon_256x256.png     >/dev/null
+            sips -z 512 512 "upstream/assets/icon@512.png" --out meatshell.iconset/icon_256x256@2x.png  >/dev/null
+            sips -z 512 512 "upstream/assets/icon@512.png" --out meatshell.iconset/icon_512x512.png     >/dev/null
+            iconutil -c icns meatshell.iconset -o "$CONTENTS/Resources/meatshell.icns"
+
+            # 生成 Info.plist
+            VERSION_NUM="${VERSION#v}"
+            sed "s/__VERSION__/${VERSION_NUM}/g" upstream/assets/Info.plist > "$CONTENTS/Info.plist" 2>/dev/null || true
+
+            # 代码签名
+            codesign --force --deep --sign - "$APP" 2>/dev/null || true
+
+            # 打包
+            ditto -c -k --keepParent "$APP" "${STAGE}.zip"
+            echo "ASSET=${STAGE}.zip" >> "$GITHUB_ENV"
+
+          elif [ "${{ runner.os }}" = "Windows" ]; then
+            mkdir "$STAGE"
+            cp "upstream/target/${{ matrix.target }}/release/${{ matrix.bin }}" "$STAGE/"
+            cp upstream/README.md upstream/CHANGELOG.md upstream/THIRD_PARTY_NOTICES.md "$STAGE/" 2>/dev/null || true
+            7z a "${STAGE}.zip" "$STAGE" >/dev/null
+            echo "ASSET=${STAGE}.zip" >> "$GITHUB_ENV"
+
+          else
+            # Linux
+            mkdir "$STAGE"
+            cp "upstream/target/${{ matrix.target }}/release/${{ matrix.bin }}" "$STAGE/"
+            cp upstream/README.md upstream/CHANGELOG.md upstream/THIRD_PARTY_NOTICES.md "$STAGE/" 2>/dev/null || true
+            cp upstream/assets/meatshell.desktop upstream/assets/install-linux.sh "upstream/assets/icon@512.png" "$STAGE/" 2>/dev/null || true
+            tar -czf "${STAGE}.tar.gz" "$STAGE"
+            echo "ASSET=${STAGE}.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ env.ASSET }}
+
+  release:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 下载所有构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 创建 Release 并附加二进制文件
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check.outputs.mirror_tag }}
+          name: "meatshell ${{ needs.check.outputs.upstream_version }}"
+          body: |
+            自动同步并编译自上游仓库 [jeff141/meatshell](https://github.com/jeff141/meatshell)。
+
+            ## 版本信息
+            - **上游版本**: ${{ needs.check.outputs.upstream_version }}
+            - **标签**: ${{ needs.check.outputs.mirror_tag }}
+
+            ## 下载文件说明
+            | 平台 | 文件 |
+            |------|------|
+            | Windows x86_64 | `meatshell-*-windows-x86_64.zip` |
+            | Linux x86_64 | `meatshell-*-linux-x86_64.tar.gz` |
+            | Linux ARM64 | `meatshell-*-linux-aarch64.tar.gz` |
+            | macOS Apple Silicon | `meatshell-*-macos-aarch64.zip` |
+            | macOS Intel | `meatshell-*-macos-x86_64.zip` |
+
+            ## 源码
+            上游源码已同步到本仓库的 `upstream/` 目录。
+          files: artifacts/**/*
+          draft: false
+          prerelease: false

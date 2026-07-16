@@ -1,0 +1,120 @@
+name: 同步上游仓库
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # 每天凌晨2点执行
+  workflow_dispatch:      # 支持手动触发
+
+permissions:
+  contents: write   # 允许推送代码
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 配置 Git 身份
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: 配置上游仓库
+        run: |
+          git remote add upstream https://github.com/jeff141/meatshell.git
+          git fetch upstream
+
+      - name: 同步代码到 upstream 目录
+        run: |
+          # 获取上游最新提交哈希
+          UPSTREAM_COMMIT=$(git rev-parse upstream/main)
+
+          # 检查是否已有同步记录
+          SYNC_FILE="upstream/.sync-info"
+          if [ -f "$SYNC_FILE" ]; then
+            LOCAL_SYNCED=$(head -n 1 "$SYNC_FILE")
+            if [ "$LOCAL_SYNCED" = "$UPSTREAM_COMMIT" ]; then
+              echo "本地已是最新版本，无需同步"
+              exit 0
+            fi
+          fi
+
+          # 清理旧的 upstream 目录（如果存在）
+          rm -rf upstream
+
+          # 使用 git archive 导出上游代码到 upstream 目录
+          mkdir -p upstream
+          git archive upstream/main | tar -x -C upstream/
+
+          # 记录同步的提交哈希
+          echo "$UPSTREAM_COMMIT" > upstream/.sync-info
+
+          # 添加同步时间戳
+          echo "同步时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> upstream/.sync-info
+          echo "上游仓库: https://github.com/jeff141/meatshell" >> upstream/.sync-info
+
+          echo "代码同步完成"
+
+      - name: 提交并推送更改
+        run: |
+          git add upstream/
+          git status
+
+          # 检查是否有更改
+          if git diff --cached --quiet; then
+            echo "没有新的更改需要提交"
+            exit 0
+          fi
+
+          UPSTREAM_VERSION=$(git describe --tags --abbrev=0 upstream/main 2>/dev/null || echo "unknown")
+          UPSTREAM_COMMIT=$(git rev-parse --short upstream/main)
+
+          git commit -m "同步上游代码至 $UPSTREAM_VERSION ($UPSTREAM_COMMIT)"
+          git push origin HEAD:main
+
+      - name: 创建镜像仓库标签
+        id: create-tag
+        run: |
+          UPSTREAM_VERSION=$(git describe --tags --abbrev=0 upstream/main 2>/dev/null || echo "unknown")
+          UPSTREAM_COMMIT=$(git rev-parse --short upstream/main)
+
+          # 创建镜像仓库自己的标签，格式: mirror-v0.6.3-22ac7d3
+          MIRROR_TAG="mirror-${UPSTREAM_VERSION}-${UPSTREAM_COMMIT}"
+
+          # 检查标签是否已存在
+          if git rev-parse "$MIRROR_TAG" >/dev/null 2>&1; then
+            echo "标签 $MIRROR_TAG 已存在，跳过创建"
+            exit 0
+          fi
+
+          echo "创建标签: $MIRROR_TAG"
+          git tag -a "$MIRROR_TAG" -m "同步自上游 $UPSTREAM_VERSION ($UPSTREAM_COMMIT)"
+          git push origin "$MIRROR_TAG"
+
+      - name: 同步标签
+        run: |
+          git fetch upstream --tags
+          NEW_TAGS=$(git tag --no-merged origin/main)
+
+          if [ -n "$NEW_TAGS" ]; then
+            echo "发现新标签: $NEW_TAGS"
+            FAILED_TAGS=""
+            for tag in $NEW_TAGS; do
+              if ! git push origin "$tag" 2>/dev/null; then
+                echo "警告: 标签 $tag 推送失败（可能包含 workflow 文件，需要 PAT 才能推送）"
+                FAILED_TAGS="$FAILED_TAGS $tag"
+              fi
+            done
+            if [ -n "$FAILED_TAGS" ]; then
+              echo ""
+              echo "========================================="
+              echo "以下标签推送失败（包含 workflow 文件）:"
+              echo "$FAILED_TAGS"
+              echo "如需完整同步，请配置 Personal Access Token (PAT)"
+              echo "========================================="
+            fi
+          fi

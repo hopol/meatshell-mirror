@@ -1,0 +1,47 @@
+# 依赖目录
+node_modules/
+vendor/
+target/
+
+# 构建产物
+dist/
+build/
+*.o
+*.so
+*.dylib
+*.exe
+
+# 日志文件
+*.log
+logs/
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# 编辑器配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 环境变量
+.env
+.env.local
+.env.*.local
+
+# 临时文件
+tmp/
+temp/
+*.tmp
+*.temp
+
+# 缓存目录
+.cache/
+.npm/
+.yarn/
+
+# 本地配置
+config.local.js
+config.local.ts
