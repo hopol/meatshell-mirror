@@ -543,7 +543,9 @@ pub enum SessionEvent {
         /// Top processes by CPU (#23). Empty if the host's `ps` is unusable.
         procs: Vec<ProcInfo>,
         /// Detailed system information for the detached system-info window.
-        sys: SystemDetails,
+        /// Detailed data is present only for the separately delayed one-shot
+        /// system-information probe; lightweight resource samples leave it None.
+        sys: Option<SystemDetails>,
     },
 
     /// Effective user and top-process snapshot from the dedicated lightweight
@@ -1265,6 +1267,64 @@ pub(crate) const COMPAT_CIPHER: &[russh::cipher::Name] = &[
     russh::cipher::TRIPLE_DES_CBC, // legacy fallback
 ];
 
+fn ssh_client_config() -> Arc<client::Config> {
+    Arc::new(client::Config {
+        // Keep idle connections alive (#160). The terminal usually has the
+        // resource-monitor channel streaming every 2 s, but with shell
+        // integration disabled (#140) it can go idle and be dropped by
+        // NAT / firewall / server timeouts.
+        keepalive_interval: Some(std::time::Duration::from_secs(30)),
+        // Match the normal terminal connection exactly, including compatibility
+        // fallbacks for older servers and network equipment (#172).
+        preferred: russh::Preferred {
+            kex: std::borrow::Cow::Borrowed(COMPAT_KEX),
+            cipher: std::borrow::Cow::Borrowed(COMPAT_CIPHER),
+            ..russh::Preferred::DEFAULT
+        },
+        ..<_>::default()
+    })
+}
+
+/// Perform the same SSH handshake and authentication as a real terminal
+/// connection, but disconnect immediately after authentication succeeds.
+/// Prompt events are returned through `events` so the session dialog can reuse
+/// the normal host-key, missing-credential, and MFA UI (#276).
+pub async fn test_session_auth(
+    session: Session,
+    jump: Option<Session>,
+    events: UnboundedSender<SessionEvent>,
+) -> Result<()> {
+    let config = ssh_client_config();
+    let (mut handle, mut jump_handle) =
+        connect_ssh(&session, jump.as_ref(), config.clone(), &events).await?;
+
+    let auth = authenticate_session(
+        &mut handle,
+        &mut jump_handle,
+        &session,
+        jump.as_ref(),
+        config,
+        &events,
+    )
+    .await?;
+
+    let result = match auth {
+        AuthResult::Success => Ok(()),
+        AuthResult::Cancelled => Err(anyhow!("login cancelled")),
+        AuthResult::Failed => Err(anyhow!("authentication failed")),
+    };
+
+    let _ = handle
+        .disconnect(Disconnect::ByApplication, "connection test complete", "")
+        .await;
+    if let Some(jump_handle) = jump_handle {
+        let _ = jump_handle
+            .disconnect(Disconnect::ByApplication, "connection test complete", "")
+            .await;
+    }
+    result
+}
+
 async fn run_session(
     session: Session,
     jump: Option<Session>,
@@ -1273,6 +1333,7 @@ async fn run_session(
     initial_cols: u32,
     initial_rows: u32,
 ) -> Result<()> {
+    let session_started = std::time::Instant::now();
     let _ = events.send(SessionEvent::Status(format!(
         "{} {}@{}:{} ...",
         t("连接中", "Connecting"),
@@ -1281,27 +1342,15 @@ async fn run_session(
         session.port
     )));
 
-    let config = Arc::new(client::Config {
-        // Keep idle connections alive (#160). The terminal usually has the
-        // resource-monitor channel streaming every 2 s, but with shell
-        // integration disabled (#140) it can go idle and be dropped by
-        // NAT / firewall / server timeouts. A 30 s keepalive prevents that;
-        // keepalive_max (default 3) closes a genuinely dead connection.
-        keepalive_interval: Some(std::time::Duration::from_secs(30)),
-        // Offer legacy KEX (group14/group1-sha1) and CBC ciphers as fallbacks so
-        // old servers / network gear negotiate instead of failing with
-        // "No common algorithm" (#172). Modern algorithms stay first, so a capable
-        // server still picks a strong one.
-        preferred: russh::Preferred {
-            kex: std::borrow::Cow::Borrowed(COMPAT_KEX),
-            cipher: std::borrow::Cow::Borrowed(COMPAT_CIPHER),
-            ..russh::Preferred::DEFAULT
-        },
-        ..<_>::default()
-    });
+    let config = ssh_client_config();
 
     let (mut handle, mut jump_handle) =
         connect_ssh(&session, jump.as_ref(), config.clone(), &events).await?;
+    tracing::info!(
+        "[SESSION_START] id={} stage=transport-ready elapsed_ms={}",
+        session.id,
+        session_started.elapsed().as_millis()
+    );
 
     // --- Auth (shared with SFTP + jump-host paths) ---------------------
     // Try plain `password` first, then `keyboard-interactive` on a fresh handle —
@@ -1342,6 +1391,11 @@ async fn run_session(
             return Ok(());
         }
     };
+    tracing::info!(
+        "[SESSION_START] id={} stage=authenticated elapsed_ms={}",
+        session.id,
+        session_started.elapsed().as_millis()
+    );
 
     // Keep the jump-host connection alive for the whole session — the direct-tcpip
     // tunnel that carries this session rides on it (#211).
@@ -1366,6 +1420,12 @@ async fn run_session(
         .await
         .context("request PTY")?;
     channel.request_shell(true).await.context("request shell")?;
+
+    tracing::info!(
+        "[SESSION_START] id={} stage=terminal-ready elapsed_ms={}",
+        session.id,
+        session_started.elapsed().as_millis()
+    );
 
     let _ = events.send(SessionEvent::Connected);
     let _ = events.send(SessionEvent::Status(format!(
@@ -1445,28 +1505,17 @@ async fn run_session(
     // pid/user/pcpu/pmem/args, each line clipped to 200 chars so a giant command
     // line can't bloat the stream. A host whose `ps` lacks `--sort`/`-o` simply
     // yields nothing (2>/dev/null), degrading to an empty process list.
-    const MON_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do awk '/^cpu /{print}' /proc/stat; awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree|Buffers|Cached):/{print}' /proc/meminfo; cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __ME__; id -un 2>/dev/null; echo __PS__; ps -eo pid,user:32,pcpu,pmem,args --sort=-pcpu 2>/dev/null | head -n 41 | cut -c -200; echo __SYS__; { . /etc/os-release 2>/dev/null; echo OS=${PRETTY_NAME:-$(uname -o 2>/dev/null)}; }; echo KERNEL=$(uname -s 2>/dev/null); echo KERNEL_RELEASE=$(uname -r 2>/dev/null); echo ARCH=$(uname -m 2>/dev/null); echo HOSTNAME=$(hostname 2>/dev/null); echo IPS=$(hostname -I 2>/dev/null); echo UPTIME=$(uptime -p 2>/dev/null); echo LOAD=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null); awk -F: '/model name|Hardware/{gsub(/^[ \\t]+/,\"\",$2); print \"CPU_MODEL=\"$2; exit}' /proc/cpuinfo 2>/dev/null; echo CPU_CORES=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null); awk -F: '/cache size/{gsub(/^[ \\t]+/,\"\",$2); print \"CPU_CACHE=\"$2; exit}' /proc/cpuinfo 2>/dev/null; awk -F: '/bogomips/{gsub(/^[ \\t]+/,\"\",$2); print \"CPU_BOGO=\"$2; exit}' /proc/cpuinfo 2>/dev/null; lspci 2>/dev/null | awk -F': ' '/VGA|3D|Display/{print \"GPU=\" $2; exit}'; echo __MSTICK__; sleep 2; done\n";
+    const MON_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do awk '/^cpu /{print}' /proc/stat; awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree|Buffers|Cached):/{print}' /proc/meminfo; cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __MSTICK__; sleep 2; done\n";
+    // Detailed system information is intentionally one-shot and last priority.
+    // It includes commands such as lspci/hostname that may be slow on some hosts
+    // and must never delay either the terminal or the lightweight sidebar sample.
+    const SYS_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; awk '/^cpu /{print}' /proc/stat; awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree|Buffers|Cached):/{print}' /proc/meminfo; cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __SYS__; { . /etc/os-release 2>/dev/null; echo OS=${PRETTY_NAME:-$(uname -o 2>/dev/null)}; }; echo KERNEL=$(uname -s 2>/dev/null); echo KERNEL_RELEASE=$(uname -r 2>/dev/null); echo ARCH=$(uname -m 2>/dev/null); echo HOSTNAME=$(hostname 2>/dev/null); echo IPS=$(hostname -I 2>/dev/null); echo UPTIME=$(uptime -p 2>/dev/null); echo LOAD=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null); awk -F: '/model name|Hardware/{gsub(/^[ \\t]+/,\"\",$2); print \"CPU_MODEL=\"$2; exit}' /proc/cpuinfo 2>/dev/null; echo CPU_CORES=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null); awk -F: '/cache size/{gsub(/^[ \\t]+/,\"\",$2); print \"CPU_CACHE=\"$2; exit}' /proc/cpuinfo 2>/dev/null; awk -F: '/bogomips/{gsub(/^[ \\t]+/,\"\",$2); print \"CPU_BOGO=\"$2; exit}' /proc/cpuinfo 2>/dev/null; lspci 2>/dev/null | awk -F': ' '/VGA|3D|Display/{print \"GPU=\" $2; exit}'; echo __MSTICK__\n";
     // Skip the resource monitor entirely when shell integration is off (a
     // non-POSIX / Windows server) — the /proc-based loop only spews errors there
     // (#140).
-    let mut mon_channel = if session.disable_shell_integration {
-        None
-    } else {
-        match handle.channel_open_session().await {
-            Ok(ch) => match ch.exec(true, MON_CMD).await {
-                Ok(()) => Some(ch),
-                Err(e) => {
-                    tracing::warn!("monitor exec failed: {e}");
-                    None
-                }
-            },
-            Err(e) => {
-                tracing::warn!("monitor channel open failed: {e}");
-                None
-            }
-        }
-    };
+    let mut mon_channel: Option<Channel<Msg>> = None;
     let mut mon_buf = String::new();
+    let mut sys_buf = String::new();
     let mut prev_cpu: Option<(u64, u64)> = None; // (total jiffies, idle jiffies)
     let mut prev_net: std::collections::HashMap<String, (u64, u64)> =
         std::collections::HashMap::new(); // iface -> (rx_bytes, tx_bytes)
@@ -1476,23 +1525,8 @@ async fn run_session(
     // includes probes such as `df` which can block indefinitely on a stale NFS
     // mount; that must not leave dead PIDs frozen in the process window.
     const PROC_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do echo __ME__; id -un 2>/dev/null; echo __PS__; ps -eo pid,user:32,pcpu,pmem,args --sort=-pcpu 2>/dev/null | head -n 41 | cut -c -200; echo __PSTICK__; sleep 2; done\n";
-    let mut proc_channel = if session.disable_shell_integration {
-        None
-    } else {
-        match handle.channel_open_session().await {
-            Ok(ch) => match ch.exec(true, PROC_CMD).await {
-                Ok(()) => Some(ch),
-                Err(e) => {
-                    tracing::warn!("process monitor exec failed: {e}");
-                    None
-                }
-            },
-            Err(e) => {
-                tracing::warn!("process monitor channel open failed: {e}");
-                None
-            }
-        }
-    };
+    let mut proc_channel: Option<Channel<Msg>> = None;
+    let mut sys_channel: Option<Channel<Msg>> = None;
     let mut proc_buf = String::new();
 
     // --- Port forwarding / tunnels (#56) --------------------------------
@@ -1539,6 +1573,77 @@ async fn run_session(
         }
     }
     let handle = Arc::new(handle);
+
+    // Auxiliary channels are deliberately outside the terminal-ready critical
+    // path. SFTP gets the first opportunity after Connected; lightweight
+    // resources follow, and process/system enrichment starts last.
+    let (mon_ready_tx, mut mon_ready_rx) = tokio::sync::oneshot::channel();
+    let (proc_ready_tx, mut proc_ready_rx) = tokio::sync::oneshot::channel();
+    let (sys_ready_tx, mut sys_ready_rx) = tokio::sync::oneshot::channel();
+    if session.disable_shell_integration {
+        let _ = mon_ready_tx.send(None);
+        let _ = proc_ready_tx.send(None);
+        let _ = sys_ready_tx.send(None);
+    } else {
+        let mon_handle = handle.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+            let channel = match mon_handle.channel_open_session().await {
+                Ok(ch) => match ch.exec(true, MON_CMD).await {
+                    Ok(()) => Some(ch),
+                    Err(error) => {
+                        tracing::warn!("monitor exec failed: {error}");
+                        None
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!("monitor channel open failed: {error}");
+                    None
+                }
+            };
+            let _ = mon_ready_tx.send(channel);
+        });
+        let proc_handle = handle.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            let channel = match proc_handle.channel_open_session().await {
+                Ok(ch) => match ch.exec(true, PROC_CMD).await {
+                    Ok(()) => Some(ch),
+                    Err(error) => {
+                        tracing::warn!("process monitor exec failed: {error}");
+                        None
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!("process monitor channel open failed: {error}");
+                    None
+                }
+            };
+            let _ = proc_ready_tx.send(channel);
+        });
+        let sys_handle = handle.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+            let channel = match sys_handle.channel_open_session().await {
+                Ok(ch) => match ch.exec(true, SYS_CMD).await {
+                    Ok(()) => Some(ch),
+                    Err(error) => {
+                        tracing::warn!("system-info exec failed: {error}");
+                        None
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!("system-info channel open failed: {error}");
+                    None
+                }
+            };
+            let _ = sys_ready_tx.send(channel);
+        });
+    }
+    let mut mon_start_pending = true;
+    let mut proc_start_pending = true;
+    let mut sys_start_pending = true;
+    let mut first_terminal_output = true;
     // Local (-L) and dynamic (-D) listen client-side; their tasks are aborted
     // on session exit.
     for (idx, f) in session.forwards.iter().enumerate() {
@@ -1558,6 +1663,33 @@ async fn run_session(
     // --- Main pump ------------------------------------------------------
     loop {
         tokio::select! {
+            ready = &mut mon_ready_rx, if mon_start_pending => {
+                mon_start_pending = false;
+                mon_channel = ready.unwrap_or(None);
+                tracing::debug!(
+                    "[SESSION_START] id={} stage=resources-started elapsed_ms={}",
+                    session.id,
+                    session_started.elapsed().as_millis()
+                );
+            }
+            ready = &mut proc_ready_rx, if proc_start_pending => {
+                proc_start_pending = false;
+                proc_channel = ready.unwrap_or(None);
+                tracing::debug!(
+                    "[SESSION_START] id={} stage=process-monitor-started elapsed_ms={}",
+                    session.id,
+                    session_started.elapsed().as_millis()
+                );
+            }
+            ready = &mut sys_ready_rx, if sys_start_pending => {
+                sys_start_pending = false;
+                sys_channel = ready.unwrap_or(None);
+                tracing::debug!(
+                    "[SESSION_START] id={} stage=system-info-started elapsed_ms={}",
+                    session.id,
+                    session_started.elapsed().as_millis()
+                );
+            }
             cmd = commands.recv() => {
                 match cmd {
                     Some(SessionCommand::RawInput(bytes)) => {
@@ -1671,6 +1803,15 @@ async fn run_session(
 
                         let chunk = String::from_utf8_lossy(&data).into_owned();
 
+                        if first_terminal_output {
+                            first_terminal_output = false;
+                            tracing::info!(
+                                "[SESSION_START] id={} stage=first-terminal-output elapsed_ms={}",
+                                session.id,
+                                session_started.elapsed().as_millis()
+                            );
+                        }
+
                         // Inject PROMPT_COMMAND after the first real shell output,
                         // unless shell integration is disabled for this session
                         // (e.g. a Windows pwsh/cmd server) (#140).
@@ -1691,9 +1832,13 @@ async fn run_session(
                                 tokio::time::Instant::now()
                                     + std::time::Duration::from_millis(2000),
                             );
+                            // Paint the banner/prompt immediately. Only later
+                            // output containing our injected setup command is
+                            // buffered and stripped; the first usable terminal
+                            // frame no longer waits for shell integration.
+                            let _ = events.send(SessionEvent::Output(chunk));
                             let _ = channel.data(prompt_setup.as_bytes()).await;
-                            // Fall through: this chunk is buffered below so the
-                            // echoed setup line is stripped as a single piece.
+                            continue;
                         }
 
                         // While suppressing, buffer output until our echoed setup
@@ -1810,6 +1955,38 @@ async fn run_session(
                     }
                     Some(ChannelMsg::Close) | None => {
                         mon_channel = None;
+                    }
+                    _ => {}
+                }
+            }
+            sys = async {
+                match sys_channel.as_mut() {
+                    Some(ch) => ch.wait().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match sys {
+                    Some(ChannelMsg::Data { data }) => {
+                        sys_buf.push_str(&String::from_utf8_lossy(&data));
+                        if let Some(idx) = sys_buf.find("__MSTICK__") {
+                            let block = sys_buf[..idx].to_string();
+                            let mut detail_cpu = None;
+                            let mut detail_net = std::collections::HashMap::new();
+                            let mut detail_at = std::time::Instant::now();
+                            if let Some(details) = parse_monitor_block(
+                                &block,
+                                &mut detail_cpu,
+                                &mut detail_net,
+                                &mut detail_at,
+                            ) {
+                                let _ = events.send(details);
+                            }
+                            sys_buf.clear();
+                            sys_channel = None;
+                        }
+                    }
+                    Some(ChannelMsg::Close) | None => {
+                        sys_channel = None;
                     }
                     _ => {}
                 }
@@ -2078,18 +2255,20 @@ fn parse_monitor_block(
         return None;
     }
 
-    let sys = build_system_details(
-        &sys_kv,
-        &cpu_nums,
-        mem_total,
-        mem_avail,
-        mem_buffers,
-        mem_cached,
-        swap_total,
-        swap_free,
-        &net_counters,
-        &disks,
-    );
+    let sys = (!sys_kv.is_empty()).then(|| {
+        build_system_details(
+            &sys_kv,
+            &cpu_nums,
+            mem_total,
+            mem_avail,
+            mem_buffers,
+            mem_cached,
+            swap_total,
+            swap_free,
+            &net_counters,
+            &disks,
+        )
+    });
 
     Some(SessionEvent::ResourceStats {
         cpu_percent,
@@ -2699,6 +2878,35 @@ mod monitor_hardening_tests {
             super::SessionEvent::ResourceStats { current_user, procs, .. } => {
                 assert_eq!(current_user, "alice");
                 assert_eq!(procs[0].user, "alice");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lightweight_resource_sample_does_not_replace_system_details() {
+        let block = "cpu 1 2 3 4\nMemTotal: 1000 kB\nMemAvailable: 500 kB\n__DF__\n";
+        let mut prev = None;
+        let mut prev_net = HashMap::new();
+        let mut at = Instant::now();
+        let event = parse_monitor_block(block, &mut prev, &mut prev_net, &mut at).unwrap();
+        match event {
+            super::SessionEvent::ResourceStats { sys, .. } => assert!(sys.is_none()),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delayed_system_sample_carries_detailed_information() {
+        let block = "cpu 1 2 3 4\nMemTotal: 1000 kB\nMemAvailable: 500 kB\n__DF__\n__SYS__\nOS=Debian GNU/Linux 12\nKERNEL=Linux\n";
+        let mut prev = None;
+        let mut prev_net = HashMap::new();
+        let mut at = Instant::now();
+        let event = parse_monitor_block(block, &mut prev, &mut prev_net, &mut at).unwrap();
+        match event {
+            super::SessionEvent::ResourceStats { sys, .. } => {
+                let sys = sys.expect("delayed sample should include details");
+                assert!(sys.overview.iter().any(|(_, value)| value == "Debian GNU/Linux 12"));
             }
             other => panic!("unexpected event: {other:?}"),
         }
