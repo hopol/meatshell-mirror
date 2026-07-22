@@ -6,7 +6,7 @@
 //!   * Manage the tab list + per-tab `SessionHandle` map.
 //!   * Route Slint callbacks to the right domain module.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -202,8 +202,8 @@ use crate::config::{
 use crate::i18n::t;
 use crate::sftp::{spawn_sftp, SftpHandle};
 use crate::ssh::{
-    format_mtime, format_size, spawn_session, ProcInfo, SessionCommand, SessionEvent, SessionHandle,
-    SystemDetails,
+    format_mtime, format_size, spawn_session, test_session_auth, ProcInfo, SessionCommand,
+    SessionEvent, SessionHandle, SystemDetails,
 };
 use crate::system::{format_bytes_per_sec, format_mem, SystemSampler, SystemSnapshot};
 
@@ -276,6 +276,10 @@ struct TabStatus {
 type TabStatuses = Arc<Mutex<HashMap<String, TabStatus>>>;
 /// Last local-machine sample (shown on the welcome tab).
 type LocalSnap = Arc<Mutex<SystemSnapshot>>;
+
+fn should_block_close(exit_confirmed: bool, has_live_sessions: bool) -> bool {
+    !exit_confirmed && has_live_sessions
+}
 
 // Slint generates types into this scope.
 slint::include_modules!();
@@ -498,7 +502,10 @@ fn clamp_window_size_to_monitor(
 
     window.with_winit_window(|ww| {
         let scale = ww.scale_factor().max(0.01);
-        let monitor = ww.current_monitor()?;
+        // Before `Window::run()` makes the native window visible, winit often
+        // has no current monitor yet. Falling back to the primary monitor lets
+        // the persisted size actually apply during startup (#278).
+        let monitor = ww.current_monitor().or_else(|| ww.primary_monitor())?;
         let monitor_size = monitor.size();
         let monitor_pos = monitor.position();
         let max_w = (monitor_size.width as f64 / scale - 16.0).max(1.0) as f32;
@@ -735,6 +742,11 @@ pub fn run() -> Result<()> {
     // Windows the icon comes from the embedded .ico, so this is a no-op there.)
     let _ = slint::set_xdg_app_id("meatshell");
     let window = AppWindow::new().context("failed to build Slint window")?;
+    // Slint applies preferred-width/height while the native window is being
+    // created. Do not treat those startup Resized events as user adjustments;
+    // otherwise they overwrite the persisted size before restoration (#278).
+    let window_size_tracking_ready = Rc::new(Cell::new(false));
+    let pending_window_size_restore = Rc::new(Cell::new(None::<(f32, f32)>));
 
     // Show the crate version (from Cargo.toml at compile time) in the sidebar,
     // so the footer never drifts out of sync with the actual build.
@@ -932,6 +944,11 @@ pub fn run() -> Result<()> {
         }
         window.set_term_font_size(s.font_size() as f32);
         window.set_term_font_bold(s.terminal_bold());
+        window.set_term_cursor_style(s.terminal_cursor_style().into());
+        if let Some(color) = parse_hex_color(s.terminal_cursor_color()) {
+            window.set_term_cursor_color_hex(s.terminal_cursor_color().into());
+            window.set_term_cursor_color(color);
+        }
         window.set_output_highlight_enabled(s.output_highlight_enabled());
         window.set_output_highlight_preset(s.output_highlight_preset().into());
         window.set_output_highlight_rules(output_highlight_rule_model(&s));
@@ -1038,13 +1055,12 @@ pub fn run() -> Result<()> {
             window.set_sftp_collapsed(true);
             window.set_sftp_saved_height(s.sftp_panel_height());
         }
-        // Restore the user's preferred window size, if any (#dock).
+        // Capture the user's preferred size. The first native Resized event
+        // drives restoration below; this is deterministic and avoids guessing
+        // how long Slint/window-manager initialization takes (#278).
         let (ww, wh) = s.window_size();
-        if ww > 0.0 && wh > 0.0 {
-            let _ = clamp_window_size_to_monitor(&window.window(), Some((ww, wh)));
-        } else {
-            let _ = clamp_window_size_to_monitor(&window.window(), None);
-        }
+        let preferred = (ww > 0.0 && wh > 0.0).then_some((ww, wh));
+        pending_window_size_restore.set(preferred);
     }
     {
         let store = store.clone();
@@ -1215,6 +1231,26 @@ pub fn run() -> Result<()> {
     {
         let weak = window.as_weak();
         let store = store.clone();
+        window.on_set_term_cursor_color(move |value: SharedString| {
+            let Some(color) = parse_hex_color(value.as_str()) else {
+                return false;
+            };
+            {
+                let mut s = store.borrow_mut();
+                if !s.set_terminal_cursor_color(value.as_str()) {
+                    return false;
+                }
+                let _ = s.save();
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_term_cursor_color(color);
+            }
+            true
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
         let bufs = bufs.clone();
         window.on_add_output_highlight_rule(
             move |pattern: SharedString,
@@ -1342,6 +1378,22 @@ pub fn run() -> Result<()> {
             }
             if let Some(w) = weak.upgrade() {
                 w.set_term_font_bold(bold);
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_set_term_cursor_style(move |style: SharedString| {
+            let normalized = {
+                let mut s = store.borrow_mut();
+                s.set_terminal_cursor_style(style.to_string());
+                let normalized = s.terminal_cursor_style().to_string();
+                let _ = s.save();
+                normalized
+            };
+            if let Some(w) = weak.upgrade() {
+                w.set_term_cursor_style(normalized.into());
             }
         });
     }
@@ -2089,6 +2141,11 @@ pub fn run() -> Result<()> {
         Hidden,     // minimized / occluded → paused
     }
     let activity = Rc::new(std::cell::Cell::new(WinActivity::Active));
+    // Once the user confirms shutdown, every subsequent native/custom close
+    // request must pass through without reopening the modal. Windows Installer
+    // and Restart Manager may issue more than one close request while replacing
+    // the executable (#267).
+    let exit_confirmed = Rc::new(Cell::new(false));
 
     // --- System sampler (1 Hz) ------------------------------------------
     let sampler = Rc::new(Mutex::new(SystemSampler::new()));
@@ -2150,6 +2207,9 @@ pub fn run() -> Result<()> {
         let close_handles = handles.clone();
         let ev_store = store.clone();
         let ev_activity = activity.clone();
+        let ev_exit_confirmed = exit_confirmed.clone();
+        let ev_window_size_tracking_ready = window_size_tracking_ready.clone();
+        let ev_pending_window_size_restore = pending_window_size_restore.clone();
         let mut last_cursor_logical: Option<(f32, f32)> = None;
         let mut macos_wheel_accum = 0.0_f32;
         // Track the inputs that make up WinActivity; recompute on each change.
@@ -2239,6 +2299,29 @@ pub fn run() -> Result<()> {
                     focused = *f;
                     apply_activity(focused, minimized, occluded);
                     if *f {
+                        // Some window managers deliver the first Resized event
+                        // before the native window belongs to a monitor. Focus
+                        // is a reliable second opportunity to seed restoration;
+                        // request_inner_size will produce the Resized event that
+                        // verifies the native window actually reached the target.
+                        if !ev_window_size_tracking_ready.get() {
+                            if let (Some(win), Some(preferred)) =
+                                (weak.upgrade(), ev_pending_window_size_restore.get())
+                            {
+                                if let Some(target) =
+                                    clamp_window_size_to_monitor(&win.window(), Some(preferred))
+                                {
+                                    tracing::info!(
+                                        "[WINDOW_SIZE] focus retry saved={:.0}x{:.0} \
+                                         target={:.0}x{:.0}",
+                                        preferred.0,
+                                        preferred.1,
+                                        target.0,
+                                        target.1,
+                                    );
+                                }
+                            }
+                        }
                         refresh_revealed_main_window(weak.clone());
                     }
                 }
@@ -2268,19 +2351,88 @@ pub fn run() -> Result<()> {
                             .with_winit_window(|ww| ww.is_maximized())
                             .unwrap_or(false);
                         win.set_window_maximized(maxed);
+                        if !ev_window_size_tracking_ready.get() {
+                            if let Some(preferred) = ev_pending_window_size_restore.get() {
+                                let scale = win.window().scale_factor().max(0.01);
+                                let actual =
+                                    (size.width as f32 / scale, size.height as f32 / scale);
+                                if let Some(target) =
+                                    clamp_window_size_to_monitor(&win.window(), Some(preferred))
+                                {
+                                    tracing::info!(
+                                        "[WINDOW_SIZE] restore requested saved={:.0}x{:.0} \
+                                         target={:.0}x{:.0} actual={:.0}x{:.0} scale={:.2}",
+                                        preferred.0,
+                                        preferred.1,
+                                        target.0,
+                                        target.1,
+                                        actual.0,
+                                        actual.1,
+                                        scale,
+                                    );
+                                    if (actual.0 - target.0).abs() <= 2.0
+                                        && (actual.1 - target.1).abs() <= 2.0
+                                    {
+                                        ev_pending_window_size_restore.set(None);
+                                        ev_window_size_tracking_ready.set(true);
+                                        tracing::info!(
+                                            "[WINDOW_SIZE] restore settled at {:.0}x{:.0}",
+                                            actual.0,
+                                            actual.1
+                                        );
+                                    }
+                                } else {
+                                    tracing::warn!(
+                                        "[WINDOW_SIZE] restore deferred: no monitor available \
+                                         saved={:.0}x{:.0}",
+                                        preferred.0,
+                                        preferred.1,
+                                    );
+                                }
+                            } else {
+                                // First run: accept the initialized size as the
+                                // baseline, but do not persist this startup event.
+                                ev_window_size_tracking_ready.set(true);
+                            }
+                            return EventResult::Propagate;
+                        }
+                        // Record the last user-adjusted windowed size while the
+                        // resize event still carries authoritative native
+                        // geometry. Persisting only during CloseRequested can
+                        // observe an installer/minimize transition instead
+                        // (#278). Keep writes in memory here; save_layout flushes
+                        // the config on exit.
+                        if ev_window_size_tracking_ready.get() && !maxed && !minimized {
+                            let scale = win.window().scale_factor().max(0.01);
+                            let width = size.width as f32 / scale;
+                            let height = size.height as f32 / scale;
+                            if width > 200.0 && height > 200.0 {
+                                ev_store.borrow_mut().set_window_size(width, height);
+                                tracing::debug!(
+                                    "[WINDOW_SIZE] recorded user size {:.0}x{:.0}",
+                                    width,
+                                    height
+                                );
+                            }
+                        }
                     }
                 }
                 WEvent::CloseRequested => {
                     // Confirm before closing if there are open session tabs (#88),
                     // so a stray double-click on the title-bar icon / X / Alt+F4
-                    // doesn't silently drop live sessions. The confirm dialog's
-                    // "Close" calls quit_event_loop to actually exit.
-                    if !close_handles.borrow().is_empty() {
+                    // doesn't silently drop live sessions. Installer/Restart
+                    // Manager may send repeated requests, so never intercept
+                    // again after the user has confirmed shutdown (#267).
+                    if should_block_close(
+                        ev_exit_confirmed.get(),
+                        !close_handles.borrow().is_empty(),
+                    ) {
                         if let Some(win) = weak.upgrade() {
                             win.set_confirm_close_open(true);
                         }
                         return EventResult::PreventDefault;
                     }
+                    ev_exit_confirmed.set(true);
                     // No sessions → the window is about to close; persist layout.
                     if let Some(win) = weak.upgrade() {
                         save_layout(&win, &ev_store);
@@ -2294,10 +2446,44 @@ pub fn run() -> Result<()> {
     // Confirm-close dialog "Close" → actually quit the event loop (#88).
     {
         let weak = window.as_weak();
+        let proc_weak = proc_win.as_weak();
+        let sys_weak = sys_win.as_weak();
         let cc_store = store.clone();
+        let close_handles = handles.clone();
+        let close_sftp_handles = sftp_handles.clone();
+        let close_exit_confirmed = exit_confirmed.clone();
         window.on_confirm_close_yes(move || {
+            // Guard against a double click and against another close request
+            // arriving from Windows Installer while shutdown is in progress.
+            if close_exit_confirmed.replace(true) {
+                return;
+            }
             if let Some(w) = weak.upgrade() {
+                w.set_confirm_close_open(false);
                 save_layout(&w, &cc_store);
+                let _ = w.hide();
+            }
+            if let Some(w) = proc_weak.upgrade() {
+                let _ = w.hide();
+            }
+            if let Some(w) = sys_weak.upgrade() {
+                let _ = w.hide();
+            }
+            // Ask every worker to stop before the runtime/event loop is torn
+            // down. Clearing the maps also makes any repeated close request see
+            // no live sessions and pass through immediately.
+            {
+                let mut sessions = close_handles.borrow_mut();
+                for handle in sessions.values() {
+                    handle.close();
+                }
+                sessions.clear();
+            }
+            if let Ok(mut sftp) = close_sftp_handles.lock() {
+                for handle in sftp.values() {
+                    handle.close();
+                }
+                sftp.clear();
             }
             let _ = slint::quit_event_loop();
         });
@@ -2331,10 +2517,15 @@ pub fn run() -> Result<()> {
         let weak = window.as_weak();
         let close_handles = handles.clone();
         let wc_store = store.clone();
+        let wc_exit_confirmed = exit_confirmed.clone();
         window.on_win_close(move || {
             if let Some(w) = weak.upgrade() {
                 // Mirror the native-X behaviour: confirm if sessions are open.
-                if close_handles.borrow().is_empty() {
+                if !should_block_close(
+                    wc_exit_confirmed.get(),
+                    !close_handles.borrow().is_empty(),
+                ) {
+                    wc_exit_confirmed.set(true);
                     save_layout(&w, &wc_store);
                     let _ = slint::quit_event_loop();
                 } else {
@@ -3042,6 +3233,82 @@ fn wsl_available() -> bool {
 // Session callbacks (welcome page + dialog)
 // ---------------------------------------------------------------------------
 
+/// Build the effective session represented by the dialog. When editing, blank
+/// secret fields retain their saved values because real passwords and pasted
+/// private keys are deliberately never echoed back into the UI (#10, #276).
+fn session_from_draft(
+    draft: &SessionDraft,
+    existing: Option<&Session>,
+    forwards: Vec<crate::config::PortForward>,
+) -> Session {
+    let password = if draft.password.is_empty() {
+        existing.map(|s| s.password.clone()).unwrap_or_default()
+    } else {
+        Secret::new(draft.password.to_string())
+    };
+    let private_key_inline = if draft.private_key_inline_mode {
+        if draft.private_key_inline.is_empty() {
+            existing
+                .map(|s| s.private_key_inline.clone())
+                .unwrap_or_default()
+        } else {
+            Secret::new(draft.private_key_inline.to_string())
+        }
+    } else {
+        Secret::default()
+    };
+    let private_key_path = if draft.private_key_inline_mode {
+        String::new()
+    } else {
+        draft.private_key_path.to_string().replace('\\', "/")
+    };
+    let kind = SessionKind::from_str(&draft.kind.to_string());
+    let auto_name = match kind {
+        SessionKind::Serial => format!("{} @{}", draft.serial_port, draft.baud_rate),
+        _ if draft.user.trim().is_empty() => draft.host.to_string(),
+        _ => format!("{}@{}", draft.user, draft.host),
+    };
+    let default_port = if kind == SessionKind::Telnet { 23 } else { 22 };
+
+    Session {
+        id: draft.id.to_string(),
+        name: if draft.name.is_empty() {
+            auto_name
+        } else {
+            draft.name.to_string()
+        },
+        host: draft.host.to_string(),
+        port: if draft.port <= 0 {
+            default_port
+        } else {
+            draft.port as u16
+        },
+        user: draft.user.to_string(),
+        auth: AuthMethod::from_str(&draft.auth.to_string()),
+        password,
+        private_key_path,
+        private_key_inline,
+        proxy: draft.proxy.to_string(),
+        last_used: None,
+        group: draft.group.to_string(),
+        kind,
+        serial_port: draft.serial_port.to_string(),
+        baud_rate: if draft.baud_rate <= 0 {
+            115_200
+        } else {
+            draft.baud_rate as u32
+        },
+        data_bits: draft.data_bits as u8,
+        stop_bits: draft.stop_bits as u8,
+        parity: draft.parity.to_string(),
+        flow_control: draft.flow_control.to_string(),
+        forwards,
+        disable_shell_integration: draft.disable_shell_integration,
+        note: draft.note.to_string(),
+        jump_session_id: draft.jump_session_id.to_string(),
+    }
+}
+
 fn wire_session_callbacks(
     window: &AppWindow,
     store: Rc<RefCell<ConfigStore>>,
@@ -3586,12 +3853,14 @@ fn wire_session_callbacks(
         });
     }
 
-    // Test connection from the session dialog. This is intentionally lightweight:
-    // it checks network reachability for the current host/port without saving the
-    // draft or opening a terminal tab.
+    // Test connection from the session dialog. SSH tests use the same handshake,
+    // host-key verification, proxy/jump routing, and authentication as a real
+    // terminal connection (#276). Telnet and serial retain reachability tests.
     {
         let weak = window.as_weak();
         let runtime = runtime.clone();
+        let store = store.clone();
+        let edit_forwards = edit_forwards.clone();
         window.on_session_dialog_test(move |draft: SessionDraft| {
             let kind = draft.kind.to_string();
             if kind == "serial" {
@@ -3622,14 +3891,103 @@ fn wire_session_callbacks(
                 });
                 return;
             }
-            let host = draft.host.to_string();
-            let default_port = if kind == "telnet" { 23 } else { 22 };
-            let port = if draft.port <= 0 {
-                default_port
-            } else {
-                draft.port as u16
-            };
+
+            let existing = store.borrow().get(draft.id.as_str()).cloned();
+            let session = session_from_draft(
+                &draft,
+                existing.as_ref(),
+                edit_forwards.borrow().clone(),
+            );
             let weak_done = weak.clone();
+
+            if kind == "ssh" {
+                let jump = resolve_jump(&store, &session);
+                let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+                runtime.spawn(async move {
+                    let mut test = Box::pin(test_session_auth(session, jump, events_tx));
+                    let result = loop {
+                        tokio::select! {
+                            result = &mut test => break result,
+                            event = events_rx.recv() => {
+                                let Some(event) = event else { continue };
+                                if matches!(
+                                    event,
+                                    SessionEvent::HostKeyPrompt { .. }
+                                        | SessionEvent::CredentialPrompt { .. }
+                                        | SessionEvent::MfaPrompt { .. }
+                                ) {
+                                    let weak_prompt = weak_done.clone();
+                                    let _ = slint::invoke_from_event_loop(move || {
+                                        let Some(w) = weak_prompt.upgrade() else { return };
+                                        match event {
+                                            SessionEvent::HostKeyPrompt {
+                                                host,
+                                                port,
+                                                key_type,
+                                                fingerprint,
+                                                changed,
+                                                responder,
+                                            } => enqueue_hostkey_prompt(
+                                                &w,
+                                                host,
+                                                port,
+                                                key_type,
+                                                fingerprint,
+                                                changed,
+                                                responder,
+                                            ),
+                                            SessionEvent::CredentialPrompt {
+                                                session_id,
+                                                host,
+                                                user,
+                                                need_user,
+                                                need_password,
+                                                responder,
+                                            } => enqueue_cred_prompt(
+                                                &w,
+                                                session_id,
+                                                host,
+                                                user,
+                                                need_user,
+                                                need_password,
+                                                responder,
+                                            ),
+                                            SessionEvent::MfaPrompt {
+                                                session_id,
+                                                host,
+                                                prompt,
+                                                echo,
+                                                responder,
+                                            } => enqueue_mfa_prompt(
+                                                &w,
+                                                session_id,
+                                                host,
+                                                prompt,
+                                                echo,
+                                                responder,
+                                            ),
+                                            _ => {}
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                    };
+                    let message = match result {
+                        Ok(()) => t("连接正常", "Connection OK").to_string(),
+                        Err(e) => format!("{}: {e:#}", t("连接失败", "Connection failed")),
+                    };
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(w) = weak_done.upgrade() {
+                            w.set_dialog_test_status(message.into());
+                        }
+                    });
+                });
+                return;
+            }
+
+            let host = session.host;
+            let port = session.port;
             runtime.spawn(async move {
                 let target = format!("{host}:{port}");
                 let result = tokio::time::timeout(
@@ -3667,7 +4025,12 @@ fn wire_session_callbacks(
         let weak = window.as_weak();
         window.on_session_dialog_pick_key(move || {
             let mut dialog =
-                rfd::FileDialog::new().set_title(t("选择私钥文件", "Choose private key file"));
+                rfd::FileDialog::new()
+                    .set_title(t("选择私钥文件", "Choose private key file"))
+                    .add_filter(
+                        t("SSH 私钥", "SSH private keys"),
+                        &["ppk", "pem", "key"],
+                    );
             // Start in ~/.ssh if it exists.
             if let Some(home) = directories::UserDirs::new().map(|u| u.home_dir().join(".ssh")) {
                 if home.is_dir() {
@@ -4034,17 +4397,30 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
     };
     ctx.handles.borrow_mut().insert(tab_id.to_string(), handle);
 
-    // Separate SFTP connection for the same session (SSH only).
-    let sftp_evt_tx = if has_sftp {
+    // Separate SFTP connection for the same session (SSH only). It waits for
+    // the interactive PTY to report Connected so a second SSH handshake cannot
+    // contend with terminal startup on the same host/network path.
+    let (sftp_evt_tx, sftp_ready_tx) = if has_sftp {
         let (sftp_tx, sftp_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
-        let sftp_handle = spawn_sftp(ctx.runtime.handle(), session, jump, sftp_tx);
-        ctx.sftp_handles
-            .lock()
-            .unwrap()
-            .insert(tab_id.to_string(), sftp_handle);
-        Some(sftp_rx)
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let sftp_runtime = ctx.runtime.clone();
+        let sftp_task_runtime = sftp_runtime.clone();
+        let sftp_handles = ctx.sftp_handles.clone();
+        let sftp_tab_id = tab_id.to_string();
+        sftp_runtime.spawn(async move {
+            if ready_rx.await.is_err() {
+                return;
+            }
+            tokio::task::yield_now().await;
+            let sftp_handle =
+                spawn_sftp(sftp_task_runtime.handle(), session, jump, sftp_tx);
+            if let Ok(mut handles) = sftp_handles.lock() {
+                handles.insert(sftp_tab_id, sftp_handle);
+            }
+        });
+        (Some(sftp_rx), Some(ready_tx))
     } else {
-        None
+        (None, None)
     };
 
     // --- Shell event pump (dedicated thread) ---
@@ -4062,6 +4438,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         let render_gates_pump = ctx.render_gates.clone();
         std::thread::spawn(move || {
             let mut shell_rx = rx;
+            let mut sftp_ready_tx = sftp_ready_tx;
             let mut cwd_debounce: Option<tokio::task::JoinHandle<()>> = None;
             // Reusable scratch so a fast firehose doesn't reallocate every batch.
             let mut drained: Vec<SessionEvent> = Vec::new();
@@ -4091,6 +4468,12 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                 let mut ui_batch: Vec<SessionEvent> = Vec::with_capacity(drained.len());
                 for evt in drained.drain(..) {
                     match evt {
+                        SessionEvent::Connected => {
+                            if let Some(ready) = sftp_ready_tx.take() {
+                                let _ = ready.send(());
+                            }
+                            ui_batch.push(SessionEvent::Connected);
+                        }
                         SessionEvent::CwdChanged(cwd) => {
                             // Shared map (not a thread-local) so manual SFTP
                             // navigation can clear the entry — then the very next
@@ -5000,8 +5383,15 @@ fn save_layout(win: &AppWindow, store: &Rc<RefCell<ConfigStore>>) {
         .window()
         .with_winit_window(|ww| ww.is_maximized())
         .unwrap_or_else(|| win.get_window_maximized());
-    if !native_maximized && w > 200.0 && h > 200.0 {
-        let (w, h) = clamp_window_size_to_monitor(&win.window(), Some((w, h))).unwrap_or((w, h));
+    let (saved_w, saved_h) = s.window_size();
+    if !native_maximized
+        && (saved_w <= 0.0 || saved_h <= 0.0)
+        && w > 200.0
+        && h > 200.0
+    {
+        // Normal resize events keep this cache current. Only fall back to the
+        // close-time geometry for a first run where no valid resize was seen;
+        // do not issue a new native resize while the window is shutting down.
         s.set_window_size(w, h);
     }
     let _ = s.save();
@@ -5226,6 +5616,17 @@ fn output_highlight_rule_model(store: &ConfigStore) -> ModelRc<OutputRuleItem> {
         })
         .collect();
     ModelRc::from(Rc::new(VecModel::from(rows)))
+}
+
+fn parse_hex_color(value: &str) -> Option<slint::Color> {
+    let digits = value.trim().strip_prefix('#').unwrap_or(value.trim());
+    if digits.len() != 6 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let red = u8::from_str_radix(&digits[0..2], 16).ok()?;
+    let green = u8::from_str_radix(&digits[2..4], 16).ok()?;
+    let blue = u8::from_str_radix(&digits[4..6], 16).ok()?;
+    Some(slint::Color::from_rgb_u8(red, green, blue))
 }
 
 fn validate_output_highlight_rule(
@@ -5950,7 +6351,9 @@ fn apply_session_event_to_window(
                 st.swap_total_kib = swap_total_kib;
                 st.net = net;
                 st.disks = disks;
-                st.sys = sys;
+                if let Some(sys) = sys {
+                    st.sys = sys;
+                }
                 // A sample means the channel is alive → treat as connected.
                 if st.state != 1 {
                     st.state = 1;
@@ -8534,6 +8937,18 @@ fn wire_key_input(
                 tracing::info!("[KEY_DIAG] Backspace PASSED all filters → sent to PTY");
             }
 
+            if should_drop_debian_bare_ctrl_marker(
+                key.as_str(),
+                ctrl,
+                debian_ctrl_marker_workaround_enabled(),
+            ) {
+                tracing::debug!(
+                    "send_key: dropped Debian/Slint bare Ctrl modifier marker {}",
+                    redact_key(key.as_str())
+                );
+                return;
+            }
+
             let bytes = key_to_pty_bytes(key.as_str(), ctrl, alt, app_cursor);
             // Log only the length — never the keystroke bytes, which can be
             // password characters (#15).
@@ -8656,6 +9071,7 @@ fn wire_key_input(
     // Middle-click / Ctrl+Shift+V: paste clipboard text into PTY.
     {
         let handles = handles.clone();
+        let bufs = bufs.clone();
         let weak = window.as_weak();
         window.on_paste_from_clipboard(move |tab_id: SharedString| {
             // Clone the (Send) command sender for this tab so the clipboard read
@@ -8667,31 +9083,26 @@ fn wire_key_input(
                 .get(tab_id.as_str())
                 .map(|h| h.commands.clone());
             let Some(sender) = sender else { return };
+            let bracketed = terminal_uses_bracketed_paste(&bufs, tab_id.as_str());
             let weak = weak.clone();
             let tab_id = tab_id.to_string();
             std::thread::spawn(move || {
                 match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
                     Ok(text) => {
                         if text.contains(['\r', '\n']) {
-                            let preview: String = text.chars().take(1200).collect();
-                            let truncated = text.chars().count() > 1200;
-                            let preview = if truncated {
-                                format!("{preview}\n…")
-                            } else {
-                                preview
-                            };
+                            let large = paste_requires_large_review(&text);
+                            let preview = text.clone();
                             let _ = slint::invoke_from_event_loop(move || {
                                 if let Some(w) = weak.upgrade() {
                                     w.set_paste_confirm_tab(tab_id.into());
                                     w.set_paste_confirm_text(text.into());
                                     w.set_paste_confirm_preview(preview.into());
+                                    w.set_paste_confirm_large(large);
                                     w.set_paste_confirm_open(true);
                                 }
                             });
                         } else {
-                            // Normalise line endings to a single CR so the
-                            // terminal receives the same input on every OS.
-                            let bytes = normalize_pasted_newlines(&text).into_bytes();
+                            let bytes = encode_pasted_text(&text, bracketed);
                             let _ = sender.send(SessionCommand::RawInput(bytes));
                         }
                     }
@@ -8704,6 +9115,7 @@ fn wire_key_input(
     // Accept a previously reviewed multi-line paste (#262).
     {
         let handles_paste = handles.clone();
+        let bufs_paste = bufs.clone();
         let weak = window.as_weak();
         window.on_paste_confirmed(move |tab_id: SharedString| {
             let Some(sender) = handles_paste
@@ -8715,9 +9127,10 @@ fn wire_key_input(
             };
             let Some(w) = weak.upgrade() else { return };
             let text = w.get_paste_confirm_text().to_string();
-            let _ = sender.send(SessionCommand::RawInput(
-                normalize_pasted_newlines(&text).into_bytes(),
-            ));
+            let bracketed = terminal_uses_bracketed_paste(&bufs_paste, tab_id.as_str());
+            let _ = sender.send(SessionCommand::RawInput(encode_pasted_text(
+                &text, bracketed,
+            )));
             w.set_paste_confirm_open(false);
         });
     }
@@ -9604,6 +10017,72 @@ fn normalize_pasted_newlines(text: &str) -> String {
     text.replace("\r\n", "\r").replace('\n', "\r")
 }
 
+/// Encode clipboard text according to the mode requested by the remote
+/// application. Bracketed paste lets shells and editors distinguish pasted
+/// text from typed keystrokes, preserving multi-line layout and indentation.
+fn encode_pasted_text(text: &str, bracketed: bool) -> Vec<u8> {
+    if !bracketed {
+        return normalize_pasted_newlines(text).into_bytes();
+    }
+
+    // A pasted ESC could forge the end marker; Ctrl+C also terminates bracketed
+    // paste in some shells. Match established terminal-emulator behaviour by
+    // filtering both before wrapping the payload.
+    let filtered = text.replace(['\x1b', '\x03'], "");
+    let mut bytes = Vec::with_capacity(filtered.len() + 12);
+    bytes.extend_from_slice(b"\x1b[200~");
+    bytes.extend_from_slice(filtered.as_bytes());
+    bytes.extend_from_slice(b"\x1b[201~");
+    bytes
+}
+
+fn terminal_uses_bracketed_paste(bufs: &TermBuffers, tab_id: &str) -> bool {
+    let buffer = bufs
+        .lock()
+        .ok()
+        .and_then(|buffers| buffers.get(tab_id).cloned());
+    buffer
+        .and_then(|buffer| {
+            buffer
+                .lock()
+                .ok()
+                .map(|buffer| buffer.parser.screen().bracketed_paste())
+        })
+        .unwrap_or(false)
+}
+
+fn should_drop_debian_bare_ctrl_marker(key: &str, ctrl: bool, workaround: bool) -> bool {
+    workaround
+        && ctrl
+        && matches!(key.chars().collect::<Vec<_>>().as_slice(), ['\u{0011}'] | ['\u{0016}'])
+}
+
+#[cfg(target_os = "linux")]
+fn debian_ctrl_marker_workaround_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let Ok(release) = std::fs::read_to_string("/etc/os-release") else {
+            return false;
+        };
+        release.lines().any(|line| {
+            let Some((key, value)) = line.split_once('=') else {
+                return false;
+            };
+            let value = value.trim_matches('"');
+            key == "ID" && value.eq_ignore_ascii_case("debian")
+                || key == "ID_LIKE"
+                    && value
+                        .split_ascii_whitespace()
+                        .any(|item| item.eq_ignore_ascii_case("debian"))
+        })
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn debian_ctrl_marker_workaround_enabled() -> bool {
+    false
+}
+
 fn key_to_pty_bytes(key: &str, ctrl: bool, alt: bool, app_cursor: bool) -> Vec<u8> {
     // --- Special keys (Slint PUA code points) ------------------------------
     // Arrow keys: respect DECCKM application-cursor mode.
@@ -9672,15 +10151,14 @@ fn key_to_pty_bytes(key: &str, ctrl: bool, alt: bool, app_cursor: bool) -> Vec<u
     // Meta and discard the line the user was typing — the "Alt clears the
     // command" bug.
     //
-    // The `!ctrl` guard is deliberate: a real Ctrl+P..Ctrl+X is encoded by some
-    // Linux/macOS builds directly as the same C0 bytes (0x10..0x18) but with
-    // ctrl=true (handled by the Ctrl branch just below), so we must NOT swallow
-    // those. A lone modifier never carries ctrl=true except bare Ctrl/CtrlR
-    // themselves, which are harmless to pass through as today.
-    if !ctrl {
-        if let Some(c) = key.chars().next() {
-            let cp = c as u32;
-            if key.chars().count() == 1 && (0x10..=0x18).contains(&cp) {
+    // Keep ctrl=true C0 values here: some Linux/macOS builds encode real
+    // Ctrl+P..Ctrl+X directly as 0x10..=0x18. Debian's bare Ctrl markers are
+    // filtered at the event boundary, where the distro-specific workaround is
+    // available (#274).
+    if let Some(c) = key.chars().next() {
+        let cp = c as u32;
+        if key.chars().count() == 1 {
+            if !ctrl && (0x10..=0x18).contains(&cp) {
                 return vec![];
             }
         }
@@ -10770,6 +11248,30 @@ impl TermBuffer {
     }
 }
 
+/// Switch long prompts to the large, scrollable paste-review surface before a
+/// compact confirmation card can grow enough to cover its own action buttons.
+fn paste_requires_large_review(text: &str) -> bool {
+    const COMPACT_CHAR_LIMIT: usize = 600;
+    const COMPACT_LINE_LIMIT: usize = 12;
+    let bytes = text.as_bytes();
+    let mut lines = 1usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\r' => {
+                lines += 1;
+                if bytes.get(index + 1) == Some(&b'\n') {
+                    index += 1;
+                }
+            }
+            b'\n' => lines += 1,
+            _ => {}
+        }
+        index += 1;
+    }
+    text.chars().count() > COMPACT_CHAR_LIMIT || lines > COMPACT_LINE_LIMIT
+}
+
 thread_local! {
     /// Decoded images are retained only for emoji actually seen in terminal
     /// output. A full 72x72 RGBA Twemoji is ~20 KiB; this avoids decoding on
@@ -11325,10 +11827,27 @@ mod key_tests {
     #[test]
     fn ctrl_letter_c0_still_passes() {
         // A real Ctrl+R encoded as the C0 byte 0x12 with ctrl=true must still be
-        // forwarded — the !ctrl guard keeps the #43 fix from breaking it.
+        // forwarded; the #274 fix filters only bare Ctrl/CtrlR markers.
         assert_eq!(key_to_pty_bytes("\u{0012}", true, false, false), vec![0x12]);
         // Ctrl+X as C0 0x18.
         assert_eq!(key_to_pty_bytes("\u{0018}", true, false, false), vec![0x18]);
+    }
+
+    #[test]
+    fn debian_bare_ctrl_markers_do_not_reach_nano() {
+        // Slint on Debian emits these before the actual Ctrl+letter event.
+        assert!(should_drop_debian_bare_ctrl_marker("\u{0011}", true, true));
+        assert!(should_drop_debian_bare_ctrl_marker("\u{0016}", true, true));
+        // Other platforms retain their existing direct-C0 behaviour.
+        assert!(!should_drop_debian_bare_ctrl_marker(
+            "\u{0011}",
+            true,
+            false
+        ));
+        assert!(!should_drop_debian_bare_ctrl_marker("x", true, true));
+        // The following Ctrl+X must still become CAN (0x18), which nano uses
+        // for Exit.
+        assert_eq!(key_to_pty_bytes("x", true, false, false), vec![0x18]);
     }
 
     #[test]
@@ -11373,6 +11892,39 @@ mod key_tests {
         assert_eq!(normalize_pasted_newlines("a\rb"), "a\rb");
         // No newlines → unchanged.
         assert_eq!(normalize_pasted_newlines("echo hi"), "echo hi");
+    }
+
+    #[test]
+    fn paste_uses_remote_bracketed_paste_mode() {
+        assert_eq!(
+            encode_pasted_text("first\r\n  second", true),
+            b"\x1b[200~first\r\n  second\x1b[201~"
+        );
+        assert_eq!(
+            encode_pasted_text("safe\x1b[201~\x03text", true),
+            b"\x1b[200~safe[201~text\x1b[201~"
+        );
+        assert_eq!(
+            encode_pasted_text("first\r\nsecond", false),
+            b"first\rsecond"
+        );
+    }
+
+    #[test]
+    fn long_pastes_switch_to_large_review() {
+        assert!(!paste_requires_large_review("short prompt\nsecond line"));
+        assert!(!paste_requires_large_review(&"a".repeat(600)));
+        assert!(paste_requires_large_review(&"a".repeat(601)));
+        assert!(!paste_requires_large_review(&vec!["line"; 12].join("\r\n")));
+        assert!(paste_requires_large_review(&vec!["line"; 13].join("\r\n")));
+    }
+
+    #[test]
+    fn confirmed_exit_never_reopens_close_prompt() {
+        assert!(should_block_close(false, true));
+        assert!(!should_block_close(false, false));
+        assert!(!should_block_close(true, true));
+        assert!(!should_block_close(true, false));
     }
 }
 
@@ -11467,6 +12019,23 @@ mod selection_tests {
             csi_state: CsiState::Normal,
             raw: std::collections::VecDeque::new(),
         }
+    }
+
+    #[test]
+    fn paste_tracks_remote_bracketed_paste_state() {
+        let bufs = TermBuffers::default();
+        let mut buffer = make_buf(2, 20, &[], &[], 0);
+        buffer.parser.process(b"\x1b[?2004h");
+        bufs.lock()
+            .unwrap()
+            .insert("tab".into(), Arc::new(Mutex::new(buffer)));
+
+        assert!(terminal_uses_bracketed_paste(&bufs, "tab"));
+        assert!(!terminal_uses_bracketed_paste(&bufs, "missing"));
+
+        let buffer = term_buf(&bufs, "tab").unwrap();
+        buffer.lock().unwrap().parser.process(b"\x1b[?2004l");
+        assert!(!terminal_uses_bracketed_paste(&bufs, "tab"));
     }
 
     #[test]
