@@ -50,12 +50,16 @@ jobs:
           mkdir -p upstream
           git archive upstream/main | tar -x -C upstream/
 
+          # 获取上游版本信息
+          UPSTREAM_VERSION=$(git describe --tags --abbrev=0 upstream/main 2>/dev/null || echo "unknown")
+
           # 记录同步的提交哈希
           echo "$UPSTREAM_COMMIT" > upstream/.sync-info
 
-          # 添加同步时间戳
+          # 添加同步时间戳和版本信息
           echo "同步时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> upstream/.sync-info
           echo "上游仓库: https://github.com/jeff141/meatshell" >> upstream/.sync-info
+          echo "上游版本: $UPSTREAM_VERSION" >> upstream/.sync-info
 
           echo "代码同步完成"
 
