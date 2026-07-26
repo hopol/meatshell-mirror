@@ -5,30 +5,24 @@
 
 mod app;
 mod config;
-mod errlog;
-mod forward;
 mod i18n;
-mod known_hosts;
-mod local;
-mod panes;
-mod ppk;
-mod proxy;
-mod serial;
+mod layout;
+mod logging;
+mod resource;
+mod session;
 mod sftp;
 mod ssh;
-mod ssh_config;
-mod system;
-mod telnet;
+mod terminal;
+mod tunnel;
+mod ui;
 mod wallpaper;
-mod zmodem;
+mod webdav;
 
 fn main() -> anyhow::Result<()> {
     if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
         println!("meatshell {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-
-    prefer_windows_software_renderer();
 
     // macOS renderer is left at Slint's default (femtovg) and is NOT forced.
     //
@@ -66,22 +60,6 @@ fn main() -> anyhow::Result<()> {
     app::run()
 }
 
-#[cfg(windows)]
-fn prefer_windows_software_renderer() {
-    // Windows users reported blurry text on 2K/4K displays with fractional
-    // scaling (#224). Skia would be the usual sharper renderer, but the current
-    // Windows/MSVC dependency graph links two ICU libraries with duplicate
-    // symbols. Prefer Slint's software renderer instead: it avoids the OpenGL
-    // texture path that tends to look soft at 125%/150% scaling, while keeping
-    // SLINT_BACKEND as an explicit escape hatch for diagnostics.
-    if std::env::var_os("SLINT_BACKEND").is_none() {
-        std::env::set_var("SLINT_BACKEND", "winit-software");
-    }
-}
-
-#[cfg(not(windows))]
-fn prefer_windows_software_renderer() {}
-
 /// Set up tracing: stderr (honours RUST_LOG, default info) **plus** a capped
 /// `error.log` file at WARN and above so users can send diagnostics — e.g. a
 /// bastion disconnect reason — without setting RUST_LOG (#86).
@@ -115,12 +93,12 @@ fn init_tracing() {
 
     // One file, capped at 50 MiB, auto-overwriting when full (5 MiB was too
     // small to diagnose anything useful).
-    let file_layer = errlog::path()
-        .and_then(|p| errlog::CappedFile::open(p, 50 * 1024 * 1024).ok())
+    let file_layer = logging::path()
+        .and_then(|p| logging::CappedFile::open(p, 50 * 1024 * 1024).ok())
         .map(|cf| {
             fmt::layer()
                 .with_ansi(false)
-                .with_writer(errlog::CappedWriter::new(cf))
+                .with_writer(logging::CappedWriter::new(cf))
                 .with_filter(quiet_noise(EnvFilter::new("warn")))
         });
 

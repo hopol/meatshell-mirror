@@ -5,6 +5,42 @@ All notable changes are documented here. 本文件记录所有重要变更。
 
 ## [Unreleased]
 
+### 修复 / Fixed
+
+- **修复新建 Telnet 会话的默认端口（#303）。** 从 SSH 或串口切换到 Telnet 时，端口现在会从 SSH 默认值 `22` 自动调整为 Telnet 标准端口 `23`；切回 SSH 时恢复为 `22`，非默认端口保持不变。
+- **修复 AUR 发布工作流校验失败。** 发布步骤现在通过作业环境变量判断所需的 AUR 仓库 Secret 是否完整配置，避免在 `if` 条件中直接引用不受支持的 `secrets` 上下文而导致工作流无法运行。
+- **修复手动产物构建的版本校验。** 从分支手动运行 Release 工作流时改为根据 `Cargo.toml` 校验二进制版本，不再把分支名误当成版本号；手动构建仍只上传工作流产物，不创建 GitHub Release。
+- **修复 Windows 使用 `Ctrl+Space` 切换输入法后 Ctrl 状态残留（#309）。** 当微软输入法把 Ctrl 松开标记为 `VK_PROCESSKEY` 时，程序现在会根据事件保留的左右 Ctrl 物理键信息向 Slint 补齐对应的松开事件；正常终端 Ctrl 快捷键及其他操作系统不受影响。
+
+---
+
+### Fixed
+
+- **Use the standard Telnet port for new sessions (#303).** Switching from SSH or Serial to Telnet now changes the SSH default `22` to the standard Telnet port `23`; switching back to SSH restores `22`, while non-default ports are preserved.
+- **Fix AUR publishing workflow validation.** The publishing step now checks the required AUR repository secrets through job environment variables, avoiding the unsupported direct use of the `secrets` context in an `if` condition that prevented the workflow from running.
+- **Fix version verification for manually dispatched artifact builds.** Release workflow runs started from a branch now verify the binary against the package version in `Cargo.toml` instead of treating the branch name as a version. Manual builds continue to upload workflow artifacts without creating a GitHub Release.
+- **Fix the Ctrl modifier remaining active after switching the Windows IME with `Ctrl+Space` (#309).** When Microsoft IME labels a Ctrl release as `VK_PROCESSKEY`, the application now uses the retained left/right physical Ctrl identity to deliver the matching release to Slint. Normal terminal Ctrl shortcuts and other operating systems are unaffected.
+
+## [0.6.7] - 2026-07-25
+
+### 新增 / Added
+
+- **Windows 支持选择界面渲染器（#280）。** “设置 → 界面 → 渲染”新增自动、GPU 与软件三种模式；自动模式直接使用 Slint 的渲染器初始化与软件回退机制，不额外扫描显卡或启动检测窗口。现有安装继续默认使用软件渲染以保留高分屏、虚拟机和远程桌面的兼容性，设置将在下次启动时生效，`SLINT_BACKEND` 环境变量仍可用于诊断覆盖。
+
+### 改进 / Changed
+
+- **按业务功能重组源码目录。** 除 `main.rs` 与 `app.rs` 外，配置、终端、SSH、SFTP、布局、资源监控等 Rust 模块均迁入 `src/<功能>/` 业务包；数据结构放入 `struct/`，实现放入 `impls/`，并由各包的 `mod.rs` 提供统一入口，减少根目录文件和跨模块维护成本。
+
+---
+
+### Added
+
+- **Add selectable UI renderers on Windows (#280).** Settings → Interface → Rendering now offers Automatic, GPU, and Software modes. Automatic relies directly on Slint's renderer initialization and software fallback without scanning the GPU or opening a probe window. Existing installations keep software rendering as the compatibility default for high-DPI displays, virtual machines, and remote desktops. Changes apply on the next launch, while `SLINT_BACKEND` remains available as a diagnostic override.
+
+### Changed
+
+- **Reorganize source files into feature-oriented packages.** Rust modules other than `main.rs` and `app.rs` now live under `src/<feature>/`, covering configuration, terminal, SSH, SFTP, layout, resource monitoring, and other features. Data structures live in `struct/`, implementations in `impls/`, and each package exposes a focused `mod.rs` facade.
+
 
 ## [0.6.6] - 2026-07-23
 
