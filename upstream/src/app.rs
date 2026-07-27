@@ -548,16 +548,33 @@ where
 /// would otherwise bypass the `SLINT_BACKEND` renderer override that exists as the
 /// macOS femtovg/Skia escape hatch (#108/#129) — so we re-honour it by hand.
 #[cfg(target_os = "macos")]
-fn setup_macos_platform() {
+fn setup_macos_platform(renderer_mode: &str) {
     use i_slint_backend_winit::winit::platform::macos::WindowAttributesExtMacOS;
 
     let mut builder = i_slint_backend_winit::Backend::builder();
-    // Preserve the SLINT_BACKEND escape hatch: e.g. "winit-skia" → renderer "skia".
-    if let Ok(v) = std::env::var("SLINT_BACKEND") {
-        if let Some(r) = v.strip_prefix("winit-").filter(|r| !r.is_empty()) {
-            builder = builder.with_renderer_name(r.to_string());
-        }
+    // An explicit environment value wins, including plain "winit" (Slint's
+    // automatic choice). Otherwise use the renderer selected in Settings.
+    let env_backend = std::env::var("SLINT_BACKEND").ok();
+    let renderer = match env_backend.as_deref() {
+        Some(backend) => backend
+            .strip_prefix("winit-")
+            .filter(|renderer| !renderer.is_empty())
+            .map(str::to_owned),
+        None => Some(renderer_mode.to_owned()),
+    };
+    if let Some(renderer) = renderer.as_ref() {
+        builder = builder.with_renderer_name(renderer.clone());
     }
+    tracing::info!(
+        renderer_mode,
+        renderer = renderer.as_deref().unwrap_or("auto"),
+        source = if env_backend.is_some() {
+            "SLINT_BACKEND"
+        } else {
+            "settings"
+        },
+        "initializing macOS renderer"
+    );
     builder = builder.with_window_attributes_hook(|attrs| {
         attrs
             .with_titlebar_transparent(true)
@@ -590,7 +607,7 @@ pub fn run() -> Result<()> {
 
     // Immersive native title bar on macOS (must precede the first window).
     #[cfg(target_os = "macos")]
-    setup_macos_platform();
+    setup_macos_platform(config.renderer_mode());
 
     // --- Runtime + store -------------------------------------------------
     let runtime = Arc::new(Runtime::new().context("failed to start tokio runtime")?);
@@ -847,7 +864,10 @@ pub fn run() -> Result<()> {
     // missing custom file falls back to the plain theme).
     {
         let id = store.borrow().wallpaper().to_string();
-        apply_wallpaper(&window, &store.borrow(), &bufs, &id);
+        // Restoring a saved wallpaper must not override the user's persisted
+        // light/dark preference. Built-in wallpapers only suggest their paired
+        // theme when the user actively selects them (#theme-persistence).
+        apply_wallpaper(&window, &store.borrow(), &bufs, &id, false);
     }
     // Editable inputs (e.g. the SFTP path bar) need a CJK-capable font: the
     // embedded mono font has no Chinese glyphs and native TextInput doesn't
@@ -1360,8 +1380,12 @@ pub fn run() -> Result<()> {
         let proc_weak = proc_win.as_weak();
         window.on_set_wallpaper(move |id: SharedString| {
             let id = id.to_string();
+            let mut selected_builtin_theme = None;
             if let Some(w) = weak.upgrade() {
-                apply_wallpaper(&w, &store.borrow(), &bufs_wp, &id);
+                apply_wallpaper(&w, &store.borrow(), &bufs_wp, &id, true);
+                if crate::wallpaper::is_builtin(&id) {
+                    selected_builtin_theme = Some(w.get_dark_mode());
+                }
                 // Keep an already-open process window in sync with the change.
                 if let Some(p) = proc_weak.upgrade() {
                     sync_proc_theme(&w, &p);
@@ -1369,6 +1393,12 @@ pub fn run() -> Result<()> {
             }
             let mut s = store.borrow_mut();
             s.set_wallpaper(id);
+            // Choosing a built-in wallpaper applies its recommended palette once;
+            // persist that result so it too survives the next launch. A later
+            // manual theme toggle will overwrite this preference as expected.
+            if let Some(dark) = selected_builtin_theme {
+                s.set_theme_pref(if dark { "dark" } else { "light" }.to_string());
+            }
             let _ = s.save();
         });
     }
@@ -1385,7 +1415,7 @@ pub fn run() -> Result<()> {
             if let Some(path) = picked {
                 let id = path.to_string_lossy().to_string();
                 if let Some(w) = weak.upgrade() {
-                    apply_wallpaper(&w, &store.borrow(), &bufs_wp, &id);
+                    apply_wallpaper(&w, &store.borrow(), &bufs_wp, &id, false);
                     if let Some(p) = proc_weak.upgrade() {
                         sync_proc_theme(&w, &p);
                     }
@@ -4245,7 +4275,7 @@ fn wire_session_callbacks(
                     sel_anchor: None,
                     sel_focus: None,
                     sel_ranges: Vec::new(),
-                    history: Vec::new(),
+                    history: VecDeque::new(),
                     prev: Vec::new(),
                     view_offset: 0,
                     displayed_text: Vec::new(),
@@ -5986,7 +6016,13 @@ fn apply_custom_output_rules(
 /// immersive Theme overrides (accent / tint / image) and set `dark` from the
 /// image luminance. An empty or undecodable id turns immersive mode off and
 /// restores the user's saved light/dark theme.
-fn apply_wallpaper(window: &AppWindow, store: &ConfigStore, bufs: &TermBuffers, id: &str) {
+fn apply_wallpaper(
+    window: &AppWindow,
+    store: &ConfigStore,
+    bufs: &TermBuffers,
+    id: &str,
+    apply_builtin_theme: bool,
+) {
     match crate::wallpaper::load(id) {
         Some(wp) => {
             let (ar, ag, ab) = wp.palette.accent;
@@ -5999,7 +6035,7 @@ fn apply_wallpaper(window: &AppWindow, store: &ConfigStore, bufs: &TermBuffers, 
             // theme toggle still governs text contrast — a light/white wallpaper
             // reads best in light mode (crisp dark text) rather than being forced
             // dark and greying the text out (#wallpaper).
-            if crate::wallpaper::is_builtin(id) {
+            if apply_builtin_theme && crate::wallpaper::is_builtin(id) {
                 apply_dark_mode(window, bufs, wp.palette.is_dark);
             }
             window.set_wallpaper_active(true);
@@ -7267,6 +7303,34 @@ fn wire_tab_callbacks(
     sftp_handles: SftpHandles,
     sftp_last_cwd: SftpLastCwd,
 ) {
+    // Ctrl+Tab / Ctrl+Shift+Tab cycle within the currently focused pane (#294).
+    {
+        let weak = window.as_weak();
+        let layout = layout.clone();
+        let content_size = content_size.clone();
+        let tabs_model = tabs_model.clone();
+        let panes_model = panes_model.clone();
+        let splitters_model = splitters_model.clone();
+        let bufs_cycle = bufs.clone();
+        window.on_cycle_tab(move |reverse: bool| {
+            let next = layout.borrow_mut().cycle_focused_tab(reverse);
+            let Some(id) = next else {
+                return;
+            };
+            if let Some(w) = weak.upgrade() {
+                refresh_panes(
+                    &w,
+                    &layout.borrow(),
+                    content_size.get(),
+                    &tabs_model,
+                    &panes_model,
+                    &splitters_model,
+                );
+                rebuild_tab_display(&w, &bufs_cycle, &id);
+            }
+        });
+    }
+
     // Select a tab inside a pane: make it that pane's active tab and focus the
     // pane. refresh_panes propagates active-tab-id (→ sidebar refresh).
     {
@@ -9212,7 +9276,7 @@ fn wire_key_input(
                 let (rows, cols) = buf.parser.screen().size();
                 buf.parser = vt100::Parser::new(rows, cols, 5000);
                 buf.find_query.clear();
-                buf.history = Vec::new(); // recycle the session scrollback
+                buf.history = VecDeque::new(); // recycle the session scrollback
                 buf.prev = Vec::new();
                 buf.view_offset = 0;
                 buf.sel_anchor = None;
@@ -11611,6 +11675,19 @@ mod selection_tests {
     }
 
     #[test]
+    fn bash_readline_history_repaints_the_current_line() {
+        let mut buffer = make_buf(4, 40, &[], &[], 0);
+        buffer.ingest(b"\x1b[?2004hP> echo second");
+        // GNU readline replaces "second" with the shorter "first" using six
+        // backspaces, DCH for the leftover cell, then the replacement suffix.
+        buffer.ingest(b"\x08\x08\x08\x08\x08\x08\x1b[1Pfirst");
+        buffer.render();
+
+        assert_eq!(buffer.displayed_text[0], "P> echo first");
+        assert_eq!(buffer.parser.screen().cursor_position(), (0, 13));
+    }
+
+    #[test]
     fn vis_to_abs_maps_live_and_scrolled_consistently() {
         // history H0..H2 (3 lines), live LIVE0/LIVE1 → combined len 5.
         let live = make_buf(5, 20, &["H0", "H1", "H2"], &["LIVE0", "LIVE1"], 0);
@@ -11659,12 +11736,12 @@ mod selection_tests {
     #[test]
     fn extract_joins_soft_wrapped_rows() {
         let mut buf = make_buf(5, 10, &[], &["x"], 0);
-        buf.history = vec![
+        buf.history = VecDeque::from([
             wrapped_hist_line("0123456789"),
             wrapped_hist_line("abcdefghij"),
             hist_line("klmnop"),
             hist_line("next"),
-        ];
+        ]);
         buf.sel_anchor = Some((0, 0));
         buf.sel_focus = Some((3, 9));
         assert_eq!(
