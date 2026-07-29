@@ -3259,6 +3259,12 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
     // last), then by name within each group, and tag the first row of every
     // group with a header so the welcome list can render a folder heading (#41).
     let sessions = store.sessions();
+    let collapsed_groups = store.collapsed_session_groups();
+    let group_is_collapsed = |group: &str| {
+        collapsed_groups
+            .map(|groups| groups.iter().any(|collapsed| collapsed == group))
+            .unwrap_or(true)
+    };
 
     // Ordered list of display groups:
     //  - "default" only when there are ungrouped sessions (group == "")
@@ -3297,7 +3303,7 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
         last_used: "".into(),
         group: group.into(),
         group_header: group.into(),
-        collapsed: false,
+        collapsed: group_is_collapsed(group),
     };
 
     let mut rows: Vec<SessionInfo> = Vec::new();
@@ -3312,7 +3318,7 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
             last_used: "".into(),
             group: "system".into(),
             group_header: if i == 0 { "system".into() } else { "".into() },
-            collapsed: true,
+            collapsed: group_is_collapsed("system"),
         });
     }
     for group in &display_groups {
@@ -3345,7 +3351,7 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
                     } else {
                         "".into()
                     },
-                    collapsed: false,
+                    collapsed: group_is_collapsed(group),
                 });
             }
         }
@@ -3853,6 +3859,7 @@ fn wire_session_callbacks(
     // so the open/closed state stays put until the list is actually rebuilt.
     {
         let weak = window.as_weak();
+        let store = store.clone();
         let sessions_model = sessions_model.clone();
         window.on_toggle_group(move |group: SharedString| {
             use slint::Model as _;
@@ -3874,6 +3881,13 @@ fn wire_session_callbacks(
                         row.collapsed = new_state;
                         sessions_model.set_row_data(i, row);
                     }
+                }
+            }
+            {
+                let mut store = store.borrow_mut();
+                store.set_session_group_collapsed(&target, new_state);
+                if let Err(err) = store.save() {
+                    tracing::warn!("failed to save Quick Connect folder state: {err:#}");
                 }
             }
             if let Some(w) = weak.upgrade() {
@@ -6128,6 +6142,24 @@ fn rebuild_tab_display(win: &AppWindow, bufs: &TermBuffers, tab_id: &str) {
         row.selection = sm.clone();
         row.scroll_max = smax;
         row.scroll_offset = soff;
+    });
+    win.window().request_redraw();
+}
+
+/// Refresh only the lightweight selection overlay. Dragging used to call
+/// `rebuild_tab_display` for every mouse-move event, reparsing and rebuilding
+/// all terminal spans even though the underlying screen had not changed.
+fn refresh_terminal_selection(win: &AppWindow, bufs: &TermBuffers, tab_id: &str) {
+    let selection = with_term_buf(bufs, tab_id, |buf| {
+        let cols = buf.parser.screen().size().1;
+        buf.selection_rects_visible(cols)
+    });
+    let Some(selection) = selection else {
+        return;
+    };
+    let model = ModelRc::from(Rc::new(VecModel::from(selection)));
+    set_terminal_row(win, tab_id, move |row| {
+        row.selection = model.clone();
     });
     win.window().request_redraw();
 }
@@ -9255,13 +9287,13 @@ fn wire_key_input(
                 tracing::info!("[KEY_DIAG] Backspace PASSED all filters → sent to PTY");
             }
 
-            if should_drop_debian_bare_ctrl_marker(
+            if should_drop_bare_ctrl_marker(
                 key.as_str(),
                 ctrl,
-                debian_ctrl_marker_workaround_enabled(),
+                bare_ctrl_marker_workaround_enabled(),
             ) {
                 tracing::debug!(
-                    "send_key: dropped Debian/Slint bare Ctrl modifier marker {}",
+                    "send_key: dropped Slint bare Ctrl modifier marker {}",
                     redact_key(key.as_str())
                 );
                 return;
@@ -9641,7 +9673,7 @@ fn wire_key_input(
                 buf.sel_focus = Some(focus);
             });
             if let Some(win) = weak.upgrade() {
-                rebuild_tab_display(&win, &bufs_sel, &tid);
+                refresh_terminal_selection(&win, &bufs_sel, &tid);
             }
         });
     }
@@ -9663,7 +9695,7 @@ fn wire_key_input(
                 }
             });
             if let Some(win) = weak.upgrade() {
-                rebuild_tab_display(&win, &bufs_sel, &tid);
+                refresh_terminal_selection(&win, &bufs_sel, &tid);
             }
         });
     }
@@ -9695,7 +9727,7 @@ fn wire_key_input(
                 _ => {}
             }
             if let Some(win) = weak.upgrade() {
-                rebuild_tab_display(&win, &bufs_sel, &tid);
+                refresh_terminal_selection(&win, &bufs_sel, &tid);
             }
         });
     }
@@ -10340,14 +10372,14 @@ fn windows_process_ctrl_release(
     }
 }
 
-fn should_drop_debian_bare_ctrl_marker(key: &str, ctrl: bool, workaround: bool) -> bool {
+fn should_drop_bare_ctrl_marker(key: &str, ctrl: bool, workaround: bool) -> bool {
     workaround
         && ctrl
         && matches!(key.chars().collect::<Vec<_>>().as_slice(), ['\u{0011}'] | ['\u{0016}'])
 }
 
 #[cfg(target_os = "linux")]
-fn debian_ctrl_marker_workaround_enabled() -> bool {
+fn bare_ctrl_marker_workaround_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         let Ok(release) = std::fs::read_to_string("/etc/os-release") else {
@@ -10367,8 +10399,17 @@ fn debian_ctrl_marker_workaround_enabled() -> bool {
     })
 }
 
-#[cfg(not(target_os = "linux"))]
-fn debian_ctrl_marker_workaround_enabled() -> bool {
+// Slint reports the physical Control key through the `meta` modifier on macOS,
+// but its key text is still the Control/ControlR marker (U+0011/U+0016). If the
+// marker reaches the PTY before the following letter, nano acts on Ctrl+Q and
+// Ctrl+X appears to open search instead of exiting (#312).
+#[cfg(target_os = "macos")]
+fn bare_ctrl_marker_workaround_enabled() -> bool {
+    true
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn bare_ctrl_marker_workaround_enabled() -> bool {
     false
 }
 
@@ -10441,9 +10482,9 @@ fn key_to_pty_bytes(key: &str, ctrl: bool, alt: bool, app_cursor: bool) -> Vec<u
     // command" bug.
     //
     // Keep ctrl=true C0 values here: some Linux/macOS builds encode real
-    // Ctrl+P..Ctrl+X directly as 0x10..=0x18. Debian's bare Ctrl markers are
-    // filtered at the event boundary, where the distro-specific workaround is
-    // available (#274).
+    // Ctrl+P..Ctrl+X directly as 0x10..=0x18. Bare Ctrl/CtrlR markers are
+    // filtered at the event boundary only on affected platforms, preserving
+    // real control characters and the existing Windows behaviour (#274/#312).
     if let Some(c) = key.chars().next() {
         let cp = c as u32;
         if key.chars().count() == 1 {
@@ -11655,24 +11696,24 @@ mod key_tests {
     #[test]
     fn ctrl_letter_c0_still_passes() {
         // A real Ctrl+R encoded as the C0 byte 0x12 with ctrl=true must still be
-        // forwarded; the #274 fix filters only bare Ctrl/CtrlR markers.
+        // forwarded; the #274/#312 fix filters only bare Ctrl/CtrlR markers.
         assert_eq!(key_to_pty_bytes("\u{0012}", true, false, false), vec![0x12]);
         // Ctrl+X as C0 0x18.
         assert_eq!(key_to_pty_bytes("\u{0018}", true, false, false), vec![0x18]);
     }
 
     #[test]
-    fn debian_bare_ctrl_markers_do_not_reach_nano() {
-        // Slint on Debian emits these before the actual Ctrl+letter event.
-        assert!(should_drop_debian_bare_ctrl_marker("\u{0011}", true, true));
-        assert!(should_drop_debian_bare_ctrl_marker("\u{0016}", true, true));
+    fn platform_bare_ctrl_markers_do_not_reach_nano() {
+        // Slint on Debian and macOS emits these before the actual Ctrl+letter event.
+        assert!(should_drop_bare_ctrl_marker("\u{0011}", true, true));
+        assert!(should_drop_bare_ctrl_marker("\u{0016}", true, true));
         // Other platforms retain their existing direct-C0 behaviour.
-        assert!(!should_drop_debian_bare_ctrl_marker(
+        assert!(!should_drop_bare_ctrl_marker(
             "\u{0011}",
             true,
             false
         ));
-        assert!(!should_drop_debian_bare_ctrl_marker("x", true, true));
+        assert!(!should_drop_bare_ctrl_marker("x", true, true));
         // The following Ctrl+X must still become CAN (0x18), which nano uses
         // for Exit.
         assert_eq!(key_to_pty_bytes("x", true, false, false), vec![0x18]);

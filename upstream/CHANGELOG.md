@@ -7,13 +7,33 @@ All notable changes are documented here. 本文件记录所有重要变更。
 
 ### 修复 / Fixed
 
+- **修复 macOS 下 `Ctrl+X` 在 nano 中错误打开搜索的问题（#312）。** Slint 在 macOS 上会先把单独按下的物理 Control 键报告为控制键标记，再发送组合键字符；程序现在会在平台事件边界过滤该标记，只把随后的真实 `Ctrl+X` 控制字符发送到 PTY，同时保持 Command 应用快捷键与其他平台行为不变。
 - **改善超大终端输出的渐进显示与响应性（#311）。** 持续输出现在按累计字节预算、在完整输出块边界提交 UI 快照，并用可等待的请求代次消除丢失通知和重复渲染；当事件积压过大或夹有连接状态事件时会优先追赶队列，避免节奏等待造成内存增长或延迟 `Connected` / `Closed`。隐藏标签、标签关闭及事件循环退出均不会让输出泵固定空等。
 
 ---
 
 ### Fixed
 
+- **Fix `Ctrl+X` opening search instead of exiting nano on macOS (#312).** Slint reports a standalone physical Control press as a modifier marker on macOS before delivering the chord character. MeatShell now filters that marker at the platform event boundary and forwards only the real `Ctrl+X` control character to the PTY, without changing Command shortcuts or other platforms.
 - **Improve progressive rendering and responsiveness under very large terminal output (#311).** Sustained output now commits UI snapshots at complete output-chunk boundaries after a cumulative byte budget, while generation-based wait tickets eliminate lost notifications and redundant renders. A large event backlog or pending connection-state event switches to catch-up mode so pacing cannot inflate memory use or delay `Connected` / `Closed`; hidden tabs, tab closure, and event-loop shutdown no longer cause repeated timeout waits.
+
+### 改进 / Changed
+
+- **快速连接分组默认收起并记住展开状态。** 首次启动时快速连接中的系统与会话目录保持收起；用户展开或收起目录后会立即保存该状态，刷新会话列表及重启应用后仍保持原样。
+
+### 性能 / Performance
+
+- **提升终端鼠标拖选文字的响应速度。** 拖动选区时只刷新轻量选区图层，不再为每次鼠标移动重新生成整块终端文本与样式，长回滚记录下也能即时显示选中内容。
+
+---
+
+### Changed
+
+- **Default Quick Connect groups to collapsed and remember their state.** System and session folders start collapsed, while later expand/collapse choices are saved immediately and survive session-list refreshes and application restarts.
+
+### Performance
+
+- **Improve terminal text-selection responsiveness.** Dragging now refreshes only the lightweight selection overlay instead of rebuilding all terminal text and styling for every mouse movement, keeping selection immediate with long scrollback histories.
 
 ## [0.6.8] - 2026-07-26
 
