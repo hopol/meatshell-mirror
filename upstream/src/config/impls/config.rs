@@ -835,6 +835,28 @@ fn dedup_keep_last(items: &mut Vec<String>) {
     }
 }
 
+/// Display-only session groups that must never be persisted as user folders.
+/// `default` maps to an empty group; `system` is owned by built-in local shells.
+pub(crate) fn is_reserved_session_group(name: &str) -> bool {
+    name.eq_ignore_ascii_case("default") || name.eq_ignore_ascii_case("system")
+}
+
+/// Repair configurations created before #324, when the Move-to menu exposed
+/// the built-in `system` group as a destination for saved server sessions.
+fn normalize_reserved_session_groups(cfg: &mut ConfigFile) -> bool {
+    let old_group_count = cfg.groups.len();
+    cfg.groups
+        .retain(|group| !is_reserved_session_group(group.trim()));
+    let mut changed = cfg.groups.len() != old_group_count;
+    for session in &mut cfg.sessions {
+        if is_reserved_session_group(session.group.trim()) {
+            session.group.clear();
+            changed = true;
+        }
+    }
+    changed
+}
+
 impl ConfigStore {
     /// The prefix that marks an encrypted password blob in sessions.json.
     const ENC_PREFIX: &'static str = "enc:v1:";
@@ -962,9 +984,13 @@ impl ConfigStore {
                     // Clean up any duplicate history accumulated before #113,
                     // keeping the last (most recent) occurrence of each command.
                     dedup_keep_last(&mut cfg.command_history);
+                    // `system` and `default` are display-only group names. Older
+                    // builds allowed moving saved servers into `system`, creating
+                    // a duplicate empty-menu folder (#324).
+                    migrated |= normalize_reserved_session_groups(&mut cfg);
                     // One-time push of the new default layout to existing users
                     // (only for items they never changed). (#new-user-defaults)
-                    migrated = migrate_defaults(&mut cfg);
+                    migrated |= migrate_defaults(&mut cfg);
                     cfg
                 }
                 Err(err) => {
@@ -1010,7 +1036,10 @@ impl ConfigStore {
         &mut self.cache.sessions
     }
 
-    pub fn upsert(&mut self, session: Session) {
+    pub fn upsert(&mut self, mut session: Session) {
+        if is_reserved_session_group(session.group.trim()) {
+            session.group.clear();
+        }
         if let Some(existing) = self.cache.sessions.iter_mut().find(|s| s.id == session.id) {
             *existing = session;
         } else {
@@ -1071,7 +1100,7 @@ impl ConfigStore {
 
     /// Missing and invalid Windows values deliberately use software so upgrades
     /// preserve the high-DPI/VM compatibility from #224.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     pub fn renderer_mode(&self) -> &str {
         match self.cache.renderer_mode.as_str() {
             "auto" => "auto",
@@ -1088,12 +1117,32 @@ impl ConfigStore {
         };
     }
 
-    #[cfg(not(target_os = "macos"))]
+    /// Linux previously used Slint's automatic renderer selection and had no
+    /// settings entry. Keep that behaviour for existing configurations.
+    #[cfg(target_os = "linux")]
+    pub fn renderer_mode(&self) -> &str {
+        match self.cache.renderer_mode.as_str() {
+            "gpu" => "gpu",
+            "software" => "software",
+            _ => "auto",
+        }
+    }
+
+    #[cfg(target_os = "windows")]
     pub fn set_renderer_mode(&mut self, mode: String) {
         self.cache.renderer_mode = match mode.as_str() {
             "auto" => "auto".into(),
             "gpu" => "gpu".into(),
             _ => "software".into(),
+        };
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn set_renderer_mode(&mut self, mode: String) {
+        self.cache.renderer_mode = match mode.as_str() {
+            "gpu" => "gpu".into(),
+            "software" => "software".into(),
+            _ => "auto".into(),
         };
     }
 
@@ -1682,26 +1731,43 @@ impl ConfigStore {
         }
     }
 
-    /// Create an empty group. Ignores blank names, the reserved "default", and
-    /// duplicates.
+    /// Whether a user group already exists, including groups inferred from
+    /// sessions that were created before explicit group records were added.
+    pub fn session_group_exists(&self, name: &str) -> bool {
+        let target = name.trim();
+        if target.is_empty() {
+            return false;
+        }
+        self.cache
+            .groups
+            .iter()
+            .any(|group| group.trim().eq_ignore_ascii_case(target))
+            || self.cache.sessions.iter().any(|session| {
+                !session.group.trim().is_empty()
+                    && session.group.trim().eq_ignore_ascii_case(target)
+            })
+    }
+
+    /// Create an empty group. Ignores blank/reserved names and duplicates.
     pub fn add_group(&mut self, name: String) {
         let n = name.trim().to_string();
-        if n.is_empty() || n.eq_ignore_ascii_case("default") {
+        if n.is_empty() || is_reserved_session_group(&n) || self.session_group_exists(&n) {
             return;
         }
-        if !self.cache.groups.iter().any(|g| g == &n) {
-            self.cache.groups.push(n.clone());
-            if let Some(groups) = &mut self.cache.collapsed_session_groups {
-                groups.push(n);
-                groups.sort();
-                groups.dedup();
-            }
+        self.cache.groups.push(n.clone());
+        if let Some(groups) = &mut self.cache.collapsed_session_groups {
+            groups.push(n);
+            groups.sort();
+            groups.dedup();
         }
     }
 
     /// Delete a group. Any session still in it falls back to ungrouped — the UI
     /// only offers delete on empty groups, but we clear sessions defensively.
     pub fn remove_group(&mut self, name: &str) {
+        if is_reserved_session_group(name.trim()) {
+            return;
+        }
         self.cache.groups.retain(|g| g != name);
         if let Some(groups) = &mut self.cache.collapsed_session_groups {
             groups.retain(|group| group != name);
@@ -1713,10 +1779,15 @@ impl ConfigStore {
         }
     }
 
-    /// Rename a group, moving its sessions along. No-op for blank / "default".
+    /// Rename a group, moving its sessions along. No-op for reserved names.
     pub fn rename_group(&mut self, old: &str, new: String) {
         let n = new.trim().to_string();
-        if n.is_empty() || n.eq_ignore_ascii_case("default") || n == old {
+        if n.is_empty()
+            || is_reserved_session_group(old.trim())
+            || is_reserved_session_group(&n)
+            || n == old
+            || (!n.eq_ignore_ascii_case(old) && self.session_group_exists(&n))
+        {
             return;
         }
         for g in &mut self.cache.groups {
@@ -1933,7 +2004,7 @@ impl ConfigStore {
                 continue;
             }
             s.id = Uuid::new_v4().to_string();
-            self.cache.sessions.push(s);
+            self.upsert(s);
             added += 1;
         }
         if added > 0 {
@@ -1981,7 +2052,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     fn renderer_mode_preserves_compatibility_default_and_validates() {
         let mut store = temp_store();
         assert_eq!(store.renderer_mode(), "software");
@@ -1995,6 +2066,23 @@ mod tests {
 
         store.cache = serde_json::from_str("{}").expect("legacy config must deserialize");
         assert_eq!(store.renderer_mode(), "software");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn renderer_mode_preserves_linux_automatic_default_and_validates() {
+        let mut store = temp_store();
+        assert_eq!(store.renderer_mode(), "auto");
+
+        store.set_renderer_mode("gpu".into());
+        assert_eq!(store.renderer_mode(), "gpu");
+        store.set_renderer_mode("software".into());
+        assert_eq!(store.renderer_mode(), "software");
+        store.set_renderer_mode("unexpected".into());
+        assert_eq!(store.renderer_mode(), "auto");
+
+        store.cache = serde_json::from_str("{}").expect("legacy config must deserialize");
+        assert_eq!(store.renderer_mode(), "auto");
     }
 
     #[test]
@@ -2020,6 +2108,64 @@ mod tests {
             .unwrap()
             .iter()
             .any(|group| group == "production"));
+    }
+
+    #[test]
+    fn reserved_session_groups_are_repaired_and_rejected() {
+        let mut system_session = sample_session("misfiled");
+        system_session.group = "system".into();
+        let mut default_session = sample_session("legacy-default");
+        default_session.group = "Default".into();
+        let mut cfg = ConfigFile {
+            sessions: vec![system_session, default_session],
+            groups: vec!["system".into(), "System".into(), "default".into(), "prod".into()],
+            collapsed_session_groups: Some(vec!["system".into(), "prod".into()]),
+            ..ConfigFile::default()
+        };
+
+        assert!(normalize_reserved_session_groups(&mut cfg));
+        assert_eq!(cfg.groups, ["prod"]);
+        assert!(cfg.sessions.iter().all(|session| session.group.is_empty()));
+        // The built-in system folder's collapse preference is display state,
+        // not a user-created group, so normalization must preserve it.
+        assert_eq!(
+            cfg.collapsed_session_groups.as_deref(),
+            Some(["system".to_string(), "prod".to_string()].as_slice())
+        );
+
+        let mut store = temp_store();
+        store.add_group("system".into());
+        store.add_group("DEFAULT".into());
+        store.add_group("prod".into());
+        store.rename_group("prod", "System".into());
+        assert_eq!(store.groups(), ["prod"]);
+
+        let mut session = sample_session("server");
+        session.group = "SYSTEM".into();
+        let id = session.id.clone();
+        store.upsert(session);
+        assert_eq!(store.get(&id).unwrap().group, "");
+    }
+
+    #[test]
+    fn session_group_names_are_unique_case_insensitively() {
+        let mut store = temp_store();
+        store.add_group("Production".into());
+        store.add_group("production".into());
+        assert_eq!(store.groups(), ["Production"]);
+        assert!(store.session_group_exists(" PRODUCTION "));
+
+        let mut session = sample_session("staging-server");
+        session.group = "Staging".into();
+        store.upsert(session);
+        assert!(store.session_group_exists("staging"));
+
+        store.rename_group("Production", "STAGING".into());
+        assert_eq!(store.groups(), ["Production"]);
+
+        // Changing only the spelling/case of the same group remains valid.
+        store.rename_group("Production", "production".into());
+        assert_eq!(store.groups(), ["production"]);
     }
 
     #[test]

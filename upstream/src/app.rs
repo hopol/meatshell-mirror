@@ -43,9 +43,11 @@ fn with_term_buf<R>(
     Some(f(&mut guard))
 }
 
-fn ingest_terminal_output(bufs: &TermBuffers, tab_id: &str, chunk: &[u8]) {
+fn ingest_terminal_output(bufs: &TermBuffers, tab_id: &str, chunk: &[u8]) -> Vec<u8> {
     if let Some(h) = term_buf(bufs, tab_id) {
-        h.lock().unwrap().ingest(chunk);
+        h.lock().unwrap().ingest(chunk)
+    } else {
+        Vec::new()
     }
 }
 
@@ -77,73 +79,8 @@ fn event_requires_immediate_ui(event: &SessionEvent) -> bool {
 }
 
 #[cfg(test)]
-mod ingest_frame_tests {
-    use super::{event_requires_immediate_ui, record_ingested_chunk, INGEST_FRAME_BUDGET};
-    use crate::ssh::SessionEvent;
-
-    fn count_requests(chunk_lengths: &[usize]) -> (usize, usize) {
-        let mut since_checkpoint = 0usize;
-        let mut requests = 0usize;
-        let mut dirty_since_request = false;
-        for &chunk_len in chunk_lengths {
-            dirty_since_request = true;
-            if record_ingested_chunk(chunk_len, &mut since_checkpoint) {
-                requests += 1;
-                dirty_since_request = false;
-            }
-        }
-        if dirty_since_request {
-            requests += 1;
-        }
-        (requests, since_checkpoint)
-    }
-
-    #[test]
-    fn exact_frame_budget_chunks_do_not_add_an_empty_tail_request() {
-        let (requests, remainder) = count_requests(&[INGEST_FRAME_BUDGET, INGEST_FRAME_BUDGET]);
-        assert_eq!(requests, 2);
-        assert_eq!(remainder, 0);
-    }
-
-    #[test]
-    fn a_partial_tail_gets_one_final_request() {
-        let (requests, remainder) = count_requests(&[INGEST_FRAME_BUDGET, INGEST_FRAME_BUDGET, 1]);
-        assert_eq!(requests, 3);
-        assert_eq!(remainder, 1);
-    }
-
-    #[test]
-    fn checkpoint_budget_carries_across_input_events() {
-        let mut since_checkpoint = 0usize;
-        assert!(!record_ingested_chunk(
-            INGEST_FRAME_BUDGET - 1,
-            &mut since_checkpoint
-        ));
-        assert!(record_ingested_chunk(1, &mut since_checkpoint));
-        assert_eq!(since_checkpoint, 0);
-    }
-
-    #[test]
-    fn an_oversized_output_event_stays_one_atomic_checkpoint() {
-        let (requests, remainder) = count_requests(&[INGEST_FRAME_BUDGET * 2 + 1]);
-        assert_eq!(requests, 1);
-        assert_eq!(remainder, 1);
-    }
-
-    #[test]
-    fn routine_shell_metadata_does_not_disable_tail_pacing() {
-        assert!(!event_requires_immediate_ui(&SessionEvent::CommandRan(
-            "tail -n 1000000 app.log".into()
-        )));
-        assert!(!event_requires_immediate_ui(&SessionEvent::CwdChanged(
-            "/var/log".into()
-        )));
-        assert!(event_requires_immediate_ui(&SessionEvent::Connected));
-        assert!(event_requires_immediate_ui(&SessionEvent::Closed(
-            "connection lost".into()
-        )));
-    }
-}
+#[path = "../tests/app/terminal_ingest/mod.rs"]
+mod ingest_frame_tests;
 
 use anyhow::{Context, Result};
 use i_slint_backend_winit::WinitWindowAccessor;
@@ -151,7 +88,8 @@ use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use tokio::runtime::Runtime;
 
 use crate::config::{
-    AuthMethod, ConfigStore, OutputHighlightRule, Secret, Session, SessionKind,
+    is_reserved_session_group, AuthMethod, ConfigStore, OutputHighlightRule, Secret, Session,
+    SessionKind,
 };
 use crate::i18n::t;
 use crate::layout::{LogicalRect, TerminalWheelHit};
@@ -474,6 +412,54 @@ fn setup_windows_platform(renderer_mode: &str) {
     }
 }
 
+/// Linux renderer selection from Settings. Leave Slint in charge when the
+/// environment explicitly selects a backend, including non-winit backends.
+/// Automatic mode likewise keeps Slint's native backend/renderer selection.
+#[cfg(target_os = "linux")]
+fn setup_linux_platform(renderer_mode: &str) {
+    if let Some(env_backend) = std::env::var_os("SLINT_BACKEND") {
+        tracing::info!(
+            renderer_mode,
+            renderer = %env_backend.to_string_lossy(),
+            source = "SLINT_BACKEND",
+            "initializing Linux renderer"
+        );
+        return;
+    }
+
+    let renderer = match renderer_mode {
+        "gpu" => "femtovg",
+        "software" => "software",
+        _ => {
+            tracing::info!(
+                renderer_mode,
+                renderer = "auto",
+                source = "settings",
+                "initializing Linux renderer"
+            );
+            return;
+        }
+    };
+
+    tracing::info!(
+        renderer_mode,
+        renderer,
+        source = "settings",
+        "initializing Linux renderer"
+    );
+    match i_slint_backend_winit::Backend::builder()
+        .with_renderer_name(renderer.to_owned())
+        .build()
+    {
+        Ok(backend) => {
+            if slint::platform::set_platform(Box::new(backend)).is_err() {
+                tracing::warn!("Linux winit backend was already initialized");
+            }
+        }
+        Err(err) => tracing::warn!("failed to initialize Linux winit backend: {err}"),
+    }
+}
+
 fn clamp_window_size_to_monitor(
     window: &slint::Window,
     preferred: Option<(f32, f32)>,
@@ -615,21 +601,8 @@ fn refresh_revealed_main_window(weak: slint::Weak<AppWindow>) {
 }
 
 #[cfg(test)]
-mod mixed_dpi_window_tests {
-    use super::maximized_geometry_needs_repair;
-
-    #[test]
-    fn repairs_large_maximized_geometry_mismatch() {
-        assert!(maximized_geometry_needs_repair(604, 1384, 1080, 1501));
-        assert!(maximized_geometry_needs_repair(1920, 1000, 3840, 2160));
-    }
-
-    #[test]
-    fn accepts_taskbar_sized_maximized_work_area() {
-        assert!(!maximized_geometry_needs_repair(1920, 1040, 1920, 1080));
-        assert!(!maximized_geometry_needs_repair(2560, 1400, 2560, 1440));
-    }
-}
+#[path = "../tests/app/window_geometry/mod.rs"]
+mod mixed_dpi_window_tests;
 
 #[cfg(target_os = "linux")]
 fn schedule_slint_pointer_ungrab<T>(weak: slint::Weak<T>)
@@ -729,6 +702,9 @@ pub fn run() -> Result<()> {
     // invisible frame that shifts mouse hit testing (#193).
     #[cfg(windows)]
     setup_windows_platform(config.renderer_mode());
+
+    #[cfg(target_os = "linux")]
+    setup_linux_platform(config.renderer_mode());
 
     // Immersive native title bar on macOS (must precede the first window).
     #[cfg(target_os = "macos")]
@@ -1658,7 +1634,11 @@ pub fn run() -> Result<()> {
         let panes_model = panes_model.clone();
         let splitters_model = splitters_model.clone();
         window.on_content_resized(move |w: f32, h: f32| {
-            content_size.set((w, h));
+            let next = (w.max(1.0), h.max(1.0));
+            if content_size.get() == next {
+                return;
+            }
+            content_size.set(next);
             if let Some(win) = weak.upgrade() {
                 refresh_panes(
                     &win,
@@ -1689,22 +1669,30 @@ pub fn run() -> Result<()> {
             }
             {
                 let mut lay = layout.borrow_mut();
-                if v {
-                    lay.remove_tab("welcome");
-                } else if lay.leaf_of_tab("welcome").is_none() {
-                    lay.add_tab("welcome".into());
+                update_welcome_tab(&mut lay, v);
+            }
+            // Switching the property destroys the sidebar Welcome component and
+            // creates the tabbed one (or vice versa). Rebuild the pane model on
+            // the next event-loop turn so Slint never mutates that component tree
+            // recursively from inside the Switch callback (#323).
+            let weak = weak.clone();
+            let layout = layout.clone();
+            let content_size = content_size.clone();
+            let tabs_model = tabs_model.clone();
+            let panes_model = panes_model.clone();
+            let splitters_model = splitters_model.clone();
+            slint::Timer::single_shot(std::time::Duration::ZERO, move || {
+                if let Some(w) = weak.upgrade() {
+                    refresh_panes(
+                        &w,
+                        &layout.borrow(),
+                        content_size.get(),
+                        &tabs_model,
+                        &panes_model,
+                        &splitters_model,
+                    );
                 }
-            }
-            if let Some(w) = weak.upgrade() {
-                refresh_panes(
-                    &w,
-                    &layout.borrow(),
-                    content_size.get(),
-                    &tabs_model,
-                    &panes_model,
-                    &splitters_model,
-                );
-            }
+            });
         });
     }
     // Per-session SFTP state: collapse + sizes live in each tab's TerminalState so
@@ -3171,11 +3159,14 @@ fn session_groups_model(store: &ConfigStore) -> ModelRc<SharedString> {
     let mut named: Vec<String> = store
         .groups()
         .iter()
+        .filter(|group| !is_reserved_session_group(group.trim()))
         .cloned()
         .chain(
             sessions
                 .iter()
-                .filter(|s| !s.group.is_empty())
+                .filter(|s| {
+                    !s.group.is_empty() && !is_reserved_session_group(s.group.trim())
+                })
                 .map(|s| s.group.clone()),
         )
         .collect();
@@ -3244,15 +3235,20 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
     //  - "default" only when there are ungrouped sessions (group == "")
     //  - named groups: explicit folders (incl. empty ones) ∪ sessions' groups,
     //    de-duplicated, alphabetical.
-    let has_default = sessions.iter().any(|s| s.group.is_empty());
+    let has_default = sessions
+        .iter()
+        .any(|s| s.group.is_empty() || is_reserved_session_group(s.group.trim()));
     let mut named: Vec<String> = store
         .groups()
         .iter()
+        .filter(|group| !is_reserved_session_group(group.trim()))
         .cloned()
         .chain(
             sessions
                 .iter()
-                .filter(|s| !s.group.is_empty())
+                .filter(|s| {
+                    !s.group.is_empty() && !is_reserved_session_group(s.group.trim())
+                })
                 .map(|s| s.group.clone()),
         )
         .collect();
@@ -3278,6 +3274,7 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
         group: group.into(),
         group_header: group.into(),
         collapsed: group_is_collapsed(group),
+        builtin: false,
     };
 
     let mut rows: Vec<SessionInfo> = Vec::new();
@@ -3293,11 +3290,17 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
             group: "system".into(),
             group_header: if i == 0 { "system".into() } else { "".into() },
             collapsed: group_is_collapsed("system"),
+            builtin: true,
         });
     }
     for group in &display_groups {
         let mut gs: Vec<&Session> = if group == "default" {
-            sessions.iter().filter(|s| s.group.is_empty()).collect()
+            sessions
+                .iter()
+                .filter(|s| {
+                    s.group.is_empty() || is_reserved_session_group(s.group.trim())
+                })
+                .collect()
         } else {
             sessions.iter().filter(|s| &s.group == group).collect()
         };
@@ -3326,6 +3329,7 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
                         "".into()
                     },
                     collapsed: group_is_collapsed(group),
+                    builtin: false,
                 });
             }
         }
@@ -3810,8 +3814,11 @@ fn wire_session_callbacks(
                 if let Some(orig) = s.get(&id.to_string()).cloned() {
                     let mut moved = orig;
                     // "default" is the display label for ungrouped → store empty.
-                    moved.group = if group.as_str() == "default" {
+                    moved.group = if group.as_str().eq_ignore_ascii_case("default") {
                         String::new()
+                    } else if is_reserved_session_group(group.as_str().trim()) {
+                        // `system` belongs exclusively to built-in local shells.
+                        return;
                     } else {
                         group.to_string()
                     };
@@ -3876,12 +3883,33 @@ fn wire_session_callbacks(
         let store = store.clone();
         let sessions_model = sessions_model.clone();
         window.on_submit_group(move |orig: SharedString, name: SharedString| {
+            let trimmed = name.trim();
+            let error = {
+                let s = store.borrow();
+                if trimmed.is_empty() {
+                    Some(t("请输入分组名称", "Enter a group name"))
+                } else if is_reserved_session_group(trimmed) {
+                    Some(t(
+                        "该名称为系统保留分组",
+                        "This group name is reserved",
+                    ))
+                } else if (orig.is_empty() || !trimmed.eq_ignore_ascii_case(orig.as_str()))
+                    && s.session_group_exists(trimmed)
+                {
+                    Some(t("分组已存在", "Group already exists"))
+                } else {
+                    None
+                }
+            };
+            if let Some(message) = error {
+                return SharedString::from(message);
+            }
             {
                 let mut s = store.borrow_mut();
                 if orig.is_empty() {
-                    s.add_group(name.to_string());
+                    s.add_group(trimmed.to_string());
                 } else {
-                    s.rename_group(&orig.to_string(), name.to_string());
+                    s.rename_group(orig.as_str(), trimmed.to_string());
                 }
                 if let Err(err) = s.save() {
                     tracing::warn!("failed to save config: {err:#}");
@@ -3891,6 +3919,7 @@ fn wire_session_callbacks(
             if let Some(w) = weak.upgrade() {
                 let _ = w.get_sessions();
             }
+            SharedString::new()
         });
     }
     // Group delete (#41) — UI only offers this on empty groups.
@@ -4419,6 +4448,7 @@ fn wire_session_callbacks(
                     view_offset: 0,
                     displayed_text: Vec::new(),
                     csi_state: CsiState::Normal,
+                    csi_pending: Vec::new(),
                     raw: std::collections::VecDeque::new(),
                 })),
             );
@@ -4547,6 +4577,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
             initial_rows,
         ),
     };
+    let terminal_reply_tx = handle.commands.clone();
     ctx.handles.borrow_mut().insert(tab_id.to_string(), handle);
 
     // Separate SFTP connection for the same session (SSH only). It waits for
@@ -4709,7 +4740,14 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                     match evt {
                         SessionEvent::Output(chunk) => {
                             let chunk_len = chunk.len();
-                            ingest_terminal_output(&bufs_thread, &tab_id_pump, chunk.as_bytes());
+                            let reply = ingest_terminal_output(
+                                &bufs_thread,
+                                &tab_id_pump,
+                                chunk.as_bytes(),
+                            );
+                            if !reply.is_empty() {
+                                let _ = terminal_reply_tx.send(SessionCommand::RawInput(reply));
+                            }
                             remaining_output_bytes =
                                 remaining_output_bytes.saturating_sub(chunk_len);
                             dirty_since_request = true;
@@ -5030,30 +5068,8 @@ fn proc_rows(procs: &[ProcInfo], current_user: &str, tab_id: &str) -> Vec<ProcRo
 }
 
 #[cfg(test)]
-mod process_row_tests {
-    use super::*;
-
-    #[test]
-    fn marks_owner_and_preserves_source_tab() {
-        let input = vec![
-            ProcInfo { pid: 10, user: "alice".into(), cpu: 1.0, mem: 2.0, command: "own".into() },
-            ProcInfo { pid: 11, user: "root".into(), cpu: 3.0, mem: 4.0, command: "other".into() },
-        ];
-        let rows = proc_rows(&input, "alice", "term-a");
-        assert!(rows[0].own_process);
-        assert!(!rows[1].own_process);
-        assert!(rows.iter().all(|row| row.tab_id.as_str() == "term-a"));
-    }
-
-    #[test]
-    fn privilege_rules_match_effective_login_user() {
-        assert!(!process_needs_root("alice", "alice"));
-        assert!(process_needs_root("alice", "root"));
-        assert!(process_needs_root("alice", "bob"));
-        assert!(!process_needs_root("root", "root"));
-        assert!(!process_needs_root("root", "alice"));
-    }
-}
+#[path = "../tests/app/process_monitor/mod.rs"]
+mod process_row_tests;
 
 fn metric_rows(
     cpu: f32,
@@ -5798,42 +5814,8 @@ fn validated_port_forwards(
 }
 
 #[cfg(test)]
-mod port_forward_draft_tests {
-    use super::{blank_forward_draft, validated_port_forwards};
-
-    #[test]
-    fn blank_rows_are_ignored_when_saving() {
-        assert!(validated_port_forwards(&[blank_forward_draft()])
-            .unwrap()
-            .is_empty());
-    }
-
-    #[test]
-    fn filled_rows_are_saved_without_an_add_step() {
-        let mut local = blank_forward_draft();
-        local.bind_port = "8080".into();
-        local.host = "service.internal".into();
-        local.host_port = "80".into();
-
-        let mut dynamic = blank_forward_draft();
-        dynamic.kind = "dynamic".into();
-        dynamic.bind_port = "1080".into();
-
-        let forwards = validated_port_forwards(&[local, dynamic]).unwrap();
-        assert_eq!(forwards.len(), 2);
-        assert_eq!(forwards[0].bind_port, 8080);
-        assert_eq!(forwards[0].host, "service.internal");
-        assert_eq!(forwards[1].kind, "dynamic");
-        assert_eq!(forwards[1].host_port, 0);
-    }
-
-    #[test]
-    fn partially_filled_rows_block_saving() {
-        let mut draft = blank_forward_draft();
-        draft.bind_port = "8080".into();
-        assert!(validated_port_forwards(&[draft]).is_err());
-    }
-}
+#[path = "../tests/app/port_forwarding/mod.rs"]
+mod port_forward_draft_tests;
 
 /// Collect the full paths of the checked SFTP entries for a tab (#100).
 fn collect_sftp_selected(terminals: &VecModel<TerminalState>, tab_id: &str) -> Vec<String> {
@@ -5956,18 +5938,29 @@ fn validate_output_highlight_rule(
     Ok(())
 }
 
-/// Build the filtered history-view model for the dropdown: case-insensitive
-/// substring matches of `query`, in the same order as the full history (#101).
-fn history_view_model(store: &ConfigStore, query: &str) -> ModelRc<SharedString> {
+/// Build the filtered history-view rows for the dropdown, newest first. The
+/// command-history model itself remains oldest first so ↑/↓ recall keeps its
+/// existing shell-like navigation semantics (#55, #101, #331).
+fn history_view_rows(history: &[String], query: &str) -> Vec<SharedString> {
     let q = query.trim().to_lowercase();
-    let rows: Vec<SharedString> = store
-        .command_history()
+    history
         .iter()
-        .filter(|c| q.is_empty() || c.to_lowercase().contains(&q))
-        .map(|s| s.clone().into())
-        .collect();
+        .rev()
+        .filter(|command| q.is_empty() || command.to_lowercase().contains(&q))
+        .map(|command| command.clone().into())
+        .collect()
+}
+
+/// Build the filtered history-view model for the dropdown: case-insensitive
+/// substring matches of `query`, ordered from newest to oldest (#101, #331).
+fn history_view_model(store: &ConfigStore, query: &str) -> ModelRc<SharedString> {
+    let rows = history_view_rows(store.command_history(), query);
     ModelRc::from(Rc::new(VecModel::from(rows)))
 }
+
+#[cfg(test)]
+#[path = "../tests/app/command_history/mod.rs"]
+mod history_view_tests;
 
 /// Find every (case-insensitive) occurrence of `query` across the currently
 /// displayed rows and return highlight rectangles in GRID-COLUMN space (wide
@@ -6575,7 +6568,7 @@ fn apply_session_event_to_window(
         SessionEvent::Output(chunk) => {
             // Synthetic Output (disconnect hint, editor error, …) — rare, already
             // on the UI thread. Live shell output is ingested on the pump thread.
-            ingest_terminal_output(bufs, tab_id, chunk.as_bytes());
+            let _ = ingest_terminal_output(bufs, tab_id, chunk.as_bytes());
             request_tab_render_from_ui(win.as_weak(), tab_id, bufs, gates);
         }
         SessionEvent::Connected => {
@@ -7304,6 +7297,18 @@ fn update_terminal_row(
     }
 }
 
+fn update_welcome_tab(layout: &mut crate::layout::Layout, as_sidebar: bool) {
+    if as_sidebar {
+        layout.remove_tab("welcome");
+    } else if layout.leaf_of_tab("welcome").is_none() {
+        layout.add_tab("welcome".into());
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/app/welcome_sidebar/mod.rs"]
+mod welcome_sidebar_tests;
+
 fn refresh_panes(
     window: &AppWindow,
     layout: &crate::layout::Layout,
@@ -7358,8 +7363,20 @@ fn refresh_panes(
             if let Some(old) = panes_model.row_data(i) {
                 // Reuse the existing tab sub-model when the tabs are unchanged so a
                 // geometry-only refresh doesn't churn the tab strips.
-                if old.id == r.id && tabs_eq(&old.tabs, &r.tabs) {
+                let same_tabs = old.id == r.id && tabs_eq(&old.tabs, &r.tabs);
+                let unchanged = same_tabs
+                    && old.x == r.x
+                    && old.y == r.y
+                    && old.w == r.w
+                    && old.h == r.h
+                    && old.active_id == r.active_id
+                    && old.focused == r.focused
+                    && old.reserve_right == r.reserve_right;
+                if same_tabs {
                     r.tabs = old.tabs;
+                }
+                if unchanged {
+                    continue;
                 }
             }
             panes_model.set_row_data(i, r);
@@ -7381,7 +7398,17 @@ fn refresh_panes(
         .collect();
     if splitters_model.row_count() == split_infos.len() {
         for (i, r) in split_infos.into_iter().enumerate() {
-            splitters_model.set_row_data(i, r);
+            let unchanged = splitters_model.row_data(i).is_some_and(|old| {
+                old.split_id == r.split_id
+                    && old.x == r.x
+                    && old.y == r.y
+                    && old.w == r.w
+                    && old.h == r.h
+                    && old.vertical == r.vertical
+            });
+            if !unchanged {
+                splitters_model.set_row_data(i, r);
+            }
         }
     } else {
         splitters_model.set_vec(split_infos);
@@ -8675,8 +8702,8 @@ fn wire_key_input(
             std::thread::spawn(move || clipboard_set_text(t));
         });
     }
-    // Delete a history entry (#96). The model is in storage order now (#113),
-    // so the row index maps straight through.
+    // Delete a history entry (#96). The command-history model remains in
+    // storage order, so this legacy row index still maps straight through.
     {
         let store_rc = store.clone();
         let weak = window.as_weak();
@@ -10251,701 +10278,13 @@ fn parent_path(path: &str) -> String {
 }
 
 #[cfg(test)]
-mod key_tests {
-    use super::*;
-
-    #[test]
-    fn windows_process_key_ctrl_release_keeps_physical_side() {
-        use i_slint_backend_winit::winit::event::ElementState;
-        use i_slint_backend_winit::winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
-
-        let process = Key::Named(NamedKey::Process);
-        assert_eq!(
-            windows_process_ctrl_release(
-                ElementState::Released,
-                &process,
-                &PhysicalKey::Code(KeyCode::ControlLeft),
-            ),
-            Some(CtrlKeySide::Left)
-        );
-        assert_eq!(
-            windows_process_ctrl_release(
-                ElementState::Released,
-                &process,
-                &PhysicalKey::Code(KeyCode::ControlRight),
-            ),
-            Some(CtrlKeySide::Right)
-        );
-    }
-
-    #[test]
-    fn windows_process_key_recovery_ignores_other_key_events() {
-        use i_slint_backend_winit::winit::event::ElementState;
-        use i_slint_backend_winit::winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
-
-        let process = Key::Named(NamedKey::Process);
-        let left_ctrl = PhysicalKey::Code(KeyCode::ControlLeft);
-        assert_eq!(
-            windows_process_ctrl_release(ElementState::Pressed, &process, &left_ctrl),
-            None
-        );
-        assert_eq!(
-            windows_process_ctrl_release(
-                ElementState::Released,
-                &Key::Named(NamedKey::Control),
-                &left_ctrl,
-            ),
-            None
-        );
-        assert_eq!(
-            windows_process_ctrl_release(
-                ElementState::Released,
-                &process,
-                &PhysicalKey::Code(KeyCode::KeyC),
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn bare_alt_is_not_forwarded() {
-        // Slint sends Alt-alone as key=0x12 with alt=true. It must produce no
-        // bytes — otherwise it becomes ESC+0x12 and clears the input (issue #43).
-        assert_eq!(
-            key_to_pty_bytes("\u{0012}", false, true, false),
-            Vec::<u8>::new()
-        );
-    }
-
-    #[test]
-    fn bare_modifier_codes_are_dropped() {
-        // Shift..MetaR (0x10..=0x18) pressed alone (ctrl=false) → nothing sent.
-        for cp in 0x10u32..=0x18 {
-            let s = char::from_u32(cp).unwrap().to_string();
-            assert_eq!(
-                key_to_pty_bytes(&s, false, false, false),
-                Vec::<u8>::new(),
-                "code point {:#04x} should be dropped",
-                cp
-            );
-        }
-    }
-
-    #[test]
-    fn ctrl_letter_c0_still_passes() {
-        // A real Ctrl+R encoded as the C0 byte 0x12 with ctrl=true must still be
-        // forwarded; the #274/#312 fix filters only bare Ctrl/CtrlR markers.
-        assert_eq!(key_to_pty_bytes("\u{0012}", true, false, false), vec![0x12]);
-        // Ctrl+X as C0 0x18.
-        assert_eq!(key_to_pty_bytes("\u{0018}", true, false, false), vec![0x18]);
-    }
-
-    #[test]
-    fn platform_bare_ctrl_markers_do_not_reach_nano() {
-        // Slint on Debian and macOS emits these before the actual Ctrl+letter event.
-        assert!(should_drop_bare_ctrl_marker("\u{0011}", true, true));
-        assert!(should_drop_bare_ctrl_marker("\u{0016}", true, true));
-        // Other platforms retain their existing direct-C0 behaviour.
-        assert!(!should_drop_bare_ctrl_marker(
-            "\u{0011}",
-            true,
-            false
-        ));
-        assert!(!should_drop_bare_ctrl_marker("x", true, true));
-        // The following Ctrl+X must still become CAN (0x18), which nano uses
-        // for Exit.
-        assert_eq!(key_to_pty_bytes("x", true, false, false), vec![0x18]);
-    }
-
-    #[test]
-    fn alt_letter_still_sends_esc_prefix() {
-        // Alt+a (a real Meta combo) must still send ESC + 'a'.
-        assert_eq!(key_to_pty_bytes("a", false, true, false), vec![0x1b, b'a']);
-    }
-
-    #[test]
-    fn split_proxy_recognises_schemes() {
-        assert_eq!(split_proxy(""), ("none".into(), "".into()));
-        assert_eq!(
-            split_proxy("http://10.0.0.1:1022"),
-            ("http".into(), "10.0.0.1:1022".into())
-        );
-        assert_eq!(
-            split_proxy("socks5://127.0.0.1:1080"),
-            ("socks5".into(), "127.0.0.1:1080".into())
-        );
-        // user:pass survive in the host:port part.
-        assert_eq!(
-            split_proxy("http://u:p@host:8080"),
-            ("http".into(), "u:p@host:8080".into())
-        );
-        // bare host:port (legacy) → treated as socks5.
-        assert_eq!(
-            split_proxy("127.0.0.1:1080"),
-            ("socks5".into(), "127.0.0.1:1080".into())
-        );
-    }
-
-    #[test]
-    fn paste_normalizes_newlines_to_cr() {
-        // CRLF (Windows clipboard) and LF both collapse to a single CR so a
-        // backslash-continued multi-line command pastes intact.
-        assert_eq!(
-            normalize_pasted_newlines("sudo apt install \\\r\n  docker-ce"),
-            "sudo apt install \\\r  docker-ce"
-        );
-        assert_eq!(normalize_pasted_newlines("a\nb\nc"), "a\rb\rc");
-        // A lone CR is left as-is; no doubling.
-        assert_eq!(normalize_pasted_newlines("a\rb"), "a\rb");
-        // No newlines → unchanged.
-        assert_eq!(normalize_pasted_newlines("echo hi"), "echo hi");
-    }
-
-    #[test]
-    fn command_bar_preserves_multiline_heredoc() {
-        let command = "cat <<'EOF'\nHEREDOC-1\n中文-HEREDOC-2\nEOF\n";
-        let (history, bytes) = encode_command_bar_input(command).unwrap();
-        assert_eq!(history, command.trim_end());
-        assert_eq!(bytes, command.as_bytes());
-        assert!(!history.lines().any(|line| line.starts_with(' ')));
-    }
-
-    #[test]
-    fn paste_uses_remote_bracketed_paste_mode() {
-        assert_eq!(
-            encode_pasted_text("first\r\n  second", true),
-            b"\x1b[200~first\r  second\x1b[201~"
-        );
-        assert_eq!(
-            encode_pasted_text("safe\x1b[201~\x03text", true),
-            b"\x1b[200~safe[201~text\x1b[201~"
-        );
-        assert_eq!(
-            encode_pasted_text("first\r\nsecond", false),
-            b"first\rsecond"
-        );
-    }
-
-    #[test]
-    fn long_pastes_switch_to_large_review() {
-        assert!(!paste_requires_large_review("short prompt\nsecond line"));
-        assert!(!paste_requires_large_review(&"a".repeat(600)));
-        assert!(paste_requires_large_review(&"a".repeat(601)));
-        assert!(!paste_requires_large_review(&vec!["line"; 12].join("\r\n")));
-        assert!(paste_requires_large_review(&vec!["line"; 13].join("\r\n")));
-    }
-
-    #[test]
-    fn confirmed_exit_never_reopens_close_prompt() {
-        assert!(should_block_close(false, true));
-        assert!(!should_block_close(false, false));
-        assert!(!should_block_close(true, true));
-        assert!(!should_block_close(true, false));
-    }
-}
+#[path = "../tests/app/terminal_input/mod.rs"]
+mod key_tests;
 
 #[cfg(test)]
-mod selection_tests {
-    use super::*;
-
-    fn sftp_entry(name: &str, is_dir: bool) -> SftpEntry {
-        SftpEntry {
-            name: name.into(),
-            full_path: format!("/{name}").into(),
-            is_dir,
-            size: String::new().into(),
-            size_bytes: 0.0,
-            modified: String::new().into(),
-            modified_ts: 0.0,
-            mode: 0,
-            selected: false,
-        }
-    }
-
-    fn sftp_names(entries: &[SftpEntry]) -> Vec<String> {
-        entries.iter().map(|e| e.name.to_string()).collect()
-    }
-
-    #[test]
-    fn sftp_name_sort_uses_natural_numeric_order() {
-        let mut entries = vec![
-            sftp_entry("file100", false),
-            sftp_entry("file10", false),
-            sftp_entry("file2", false),
-            sftp_entry("file11", false),
-            sftp_entry("file1", false),
-        ];
-        sort_sftp_entries(&mut entries, "name", 1);
-        assert_eq!(
-            sftp_names(&entries),
-            vec!["file1", "file2", "file10", "file11", "file100"]
-        );
-
-        sort_sftp_entries(&mut entries, "name", -1);
-        assert_eq!(
-            sftp_names(&entries),
-            vec!["file100", "file11", "file10", "file2", "file1"]
-        );
-    }
-
-    #[test]
-    fn sftp_default_sort_keeps_dirs_first_with_natural_names() {
-        let mut entries = vec![
-            sftp_entry("file100", false),
-            sftp_entry("dir10", true),
-            sftp_entry("file11", false),
-            sftp_entry("dir2", true),
-        ];
-        sort_sftp_entries(&mut entries, "", 0);
-        assert_eq!(sftp_names(&entries), vec!["dir2", "dir10", "file11", "file100"]);
-    }
-
-    fn hist_line(s: &str) -> Line {
-        (s.to_string(), Vec::new(), false)
-    }
-
-    fn wrapped_hist_line(s: &str) -> Line {
-        (s.to_string(), Vec::new(), true)
-    }
-
-    /// A TermBuffer whose live screen (rows×cols) shows `live_lines`, with the
-    /// given `history` above it, viewed at `view_offset` (0 = live bottom).
-    fn make_buf(
-        rows: u16,
-        cols: u16,
-        history: &[&str],
-        live_lines: &[&str],
-        view_offset: usize,
-    ) -> TermBuffer {
-        let mut parser = vt100::Parser::new(rows, cols, 0);
-        parser.process(live_lines.join("\r\n").as_bytes());
-        TermBuffer {
-            parser,
-            find_query: String::new(),
-            is_dark: false,
-            output_highlight: OutputHighlightPreset::Log,
-            custom_highlight_rules: Vec::new(),
-            sel_anchor: None,
-            sel_focus: None,
-            sel_ranges: Vec::new(),
-            history: history.iter().map(|s| hist_line(s)).collect(),
-            prev: Vec::new(),
-            view_offset,
-            displayed_text: Vec::new(),
-            csi_state: CsiState::Normal,
-            raw: std::collections::VecDeque::new(),
-        }
-    }
-
-    #[test]
-    fn paste_tracks_remote_bracketed_paste_state() {
-        let bufs = TermBuffers::default();
-        let mut buffer = make_buf(2, 20, &[], &[], 0);
-        buffer.parser.process(b"\x1b[?2004h");
-        bufs.lock()
-            .unwrap()
-            .insert("tab".into(), Arc::new(Mutex::new(buffer)));
-
-        assert!(terminal_uses_bracketed_paste(&bufs, "tab"));
-        assert!(!terminal_uses_bracketed_paste(&bufs, "missing"));
-
-        let buffer = term_buf(&bufs, "tab").unwrap();
-        buffer.lock().unwrap().parser.process(b"\x1b[?2004l");
-        assert!(!terminal_uses_bracketed_paste(&bufs, "tab"));
-    }
-
-    #[test]
-    fn bash_readline_history_repaints_the_current_line() {
-        let mut buffer = make_buf(4, 40, &[], &[], 0);
-        buffer.ingest(b"\x1b[?2004hP> echo second");
-        // GNU readline replaces "second" with the shorter "first" using six
-        // backspaces, DCH for the leftover cell, then the replacement suffix.
-        buffer.ingest(b"\x08\x08\x08\x08\x08\x08\x1b[1Pfirst");
-        buffer.render();
-
-        assert_eq!(buffer.displayed_text[0], "P> echo first");
-        assert_eq!(buffer.parser.screen().cursor_position(), (0, 13));
-    }
-
-    #[test]
-    fn plain_click_has_no_selection_extent() {
-        let mut buffer = make_buf(2, 20, &[], &["one"], 0);
-        buffer.sel_anchor = Some((0, 1));
-        buffer.sel_focus = Some((0, 1));
-        buffer.sel_ranges.push(((0, 1), (0, 1)));
-        assert!(!buffer.selection_has_extent());
-
-        buffer.sel_focus = Some((0, 2));
-        buffer.sel_ranges[0].1 = (0, 2);
-        assert!(buffer.selection_has_extent());
-    }
-
-    #[test]
-    fn csi_3j_clears_meatshell_scrollback_even_when_split() {
-        let mut buffer = make_buf(3, 20, &["old one", "old two"], &["current"], 2);
-        buffer.raw.extend(b"old one\nold two\n");
-        buffer.prev.push(hist_line("old two"));
-        buffer.sel_anchor = Some((0, 0));
-        buffer.sel_focus = Some((1, 2));
-
-        buffer.ingest(b"\x1b[3");
-        assert_eq!(buffer.history.len(), 2);
-        buffer.ingest(b"J");
-
-        assert!(buffer.history.is_empty());
-        assert_eq!(buffer.view_offset, 0);
-        assert!(buffer.raw.is_empty());
-        assert!(buffer.sel_anchor.is_none());
-        assert!(buffer.sel_focus.is_none());
-    }
-
-    #[test]
-    fn vis_to_abs_maps_live_and_scrolled_consistently() {
-        // history H0..H2 (3 lines), live LIVE0/LIVE1 → combined len 5.
-        let live = make_buf(5, 20, &["H0", "H1", "H2"], &["LIVE0", "LIVE1"], 0);
-        assert_eq!(live.vis_to_abs(0), 3, "live row 0 is first live line");
-        assert_eq!(live.vis_to_abs(1), 4);
-
-        // Scrolled to the very top (offset = history len).
-        let top = make_buf(5, 20, &["H0", "H1", "H2"], &["LIVE0", "LIVE1"], 3);
-        assert_eq!(top.vis_to_abs(0), 0, "top row 0 is oldest history line");
-        assert_eq!(top.vis_to_abs(2), 2);
-        assert_eq!(top.vis_to_abs(3), 3, "row 3 crosses into live content");
-    }
-
-    #[test]
-    fn extract_spans_history_and_live() {
-        let mut buf = make_buf(5, 20, &["HIST0", "HIST1", "HIST2"], &["LIVE0", "LIVE1"], 3);
-        buf.sel_anchor = Some((0, 0)); // top of history
-        buf.sel_focus = Some((4, 19)); // end of last live line
-        assert_eq!(
-            buf.extract_selection_text(),
-            "HIST0\nHIST1\nHIST2\nLIVE0\nLIVE1"
-        );
-    }
-
-    #[test]
-    fn extract_is_view_independent() {
-        // The same absolute selection copies identically whether the view is
-        // scrolled to the top or sitting at the live bottom — this is the whole
-        // point of the fix (a top-to-bottom selection survives auto-scrolling).
-        let sel = |off| {
-            let mut b = make_buf(
-                5,
-                20,
-                &["HIST0", "HIST1", "HIST2"],
-                &["LIVE0", "LIVE1"],
-                off,
-            );
-            b.sel_anchor = Some((0, 0));
-            b.sel_focus = Some((4, 19));
-            b.extract_selection_text()
-        };
-        assert_eq!(sel(3), sel(0));
-        assert_eq!(sel(3), "HIST0\nHIST1\nHIST2\nLIVE0\nLIVE1");
-    }
-
-    #[test]
-    fn extract_joins_soft_wrapped_rows() {
-        let mut buf = make_buf(5, 10, &[], &["x"], 0);
-        buf.history = VecDeque::from([
-            wrapped_hist_line("0123456789"),
-            wrapped_hist_line("abcdefghij"),
-            hist_line("klmnop"),
-            hist_line("next"),
-        ]);
-        buf.sel_anchor = Some((0, 0));
-        buf.sel_focus = Some((3, 9));
-        assert_eq!(
-            buf.extract_selection_text(),
-            "0123456789abcdefghijklmnop\nnext"
-        );
-    }
-
-    #[test]
-    fn highlight_clipped_to_current_view() {
-        // Scrolled to the top: a history selection is on-screen and highlighted.
-        let mut top = make_buf(5, 20, &["HIST0", "HIST1", "HIST2"], &["LIVE0", "LIVE1"], 3);
-        top.sel_anchor = Some((0, 2));
-        top.sel_focus = Some((2, 4));
-        let rects = top.selection_rects_visible(20);
-        assert_eq!(
-            rects.len(),
-            3,
-            "rows 0,1,2 (the 3 history lines) highlighted"
-        );
-        assert_eq!(rects[0].row, 0);
-        assert_eq!(rects[2].row, 2);
-
-        // At the live bottom the same history selection is scrolled off → none.
-        let mut live = make_buf(5, 20, &["HIST0", "HIST1", "HIST2"], &["LIVE0", "LIVE1"], 0);
-        live.sel_anchor = Some((0, 2));
-        live.sel_focus = Some((2, 4));
-        assert!(live.selection_rects_visible(20).is_empty());
-    }
-
-    #[test]
-    fn extract_handles_wide_cjk_columns() {
-        // Regression for #132: copying after CJK glyphs drifted right by the
-        // number of wide chars before the selection (e.g. selecting "1pctl"
-        // yielded "ctl…"). The history line lays out on the grid as:
-        //   提(0-1) 示(2-3) :(4) space(5) 1(6) p(7) c(8) t(9) l(10)
-        let mut buf = make_buf(5, 20, &["提示: 1pctl"], &["x"], 0);
-
-        // The "1pctl" run sits at grid cols 6..=10.
-        buf.sel_anchor = Some((0, 6));
-        buf.sel_focus = Some((0, 10));
-        assert_eq!(buf.extract_selection_text(), "1pctl");
-
-        // Selecting from the second CJK glyph through the end.
-        buf.sel_anchor = Some((0, 2));
-        buf.sel_focus = Some((0, 10));
-        assert_eq!(buf.extract_selection_text(), "示: 1pctl");
-
-        // Anchoring on the *second* cell of a wide glyph still grabs the whole
-        // glyph — you can't half-select a CJK char.
-        buf.sel_anchor = Some((0, 3));
-        buf.sel_focus = Some((0, 10));
-        assert_eq!(buf.extract_selection_text(), "示: 1pctl");
-    }
-
-    #[test]
-    fn find_matches_report_grid_columns_past_cjk() {
-        // Highlight rects must sit at the GRID column, not the char index, so
-        // they line up over the text after CJK glyphs (#132).
-        let rows = vec!["提示: 1pctl".to_string()];
-        let m = compute_find_matches(&rows, "1pctl");
-        assert_eq!(m.len(), 1);
-        assert_eq!(m[0].col, 6, "grid column 6, not char index 4");
-        assert_eq!(m[0].len, 5);
-
-        // A CJK query spans two grid cells per glyph.
-        let m2 = compute_find_matches(&rows, "提示");
-        assert_eq!(m2.len(), 1);
-        assert_eq!(m2[0].col, 0);
-        assert_eq!(m2[0].len, 4, "two wide glyphs span four grid cells");
-    }
-
-    #[test]
-    fn inverse_default_colours_paint_a_visible_background() {
-        let (fg, bg) = vt_span_colors(
-            vt100::Color::Default,
-            vt100::Color::Default,
-            false,
-            true,
-            true,
-        );
-        assert_eq!(fg.as_argb_encoded(), 0xff0e0f13);
-        assert_eq!(bg.as_argb_encoded(), 0xffd4d4d4);
-
-        let mut parser = vt100::Parser::new(3, 30, 0);
-        parser.process(b"abc \x1b[7m20260705\x1b[27m end");
-        let (_plain, runs, _wrapped) = build_row(parser.screen(), 0, 30);
-        let hit = runs
-            .iter()
-            .find(|span| span.text.contains("20260705"))
-            .expect("reverse-video search hit should be a separate span");
-        assert!(hit.inverse);
-        assert!(matches!(hit.fg, vt100::Color::Default));
-        assert!(matches!(hit.bg, vt100::Color::Default));
-    }
-}
+#[path = "../tests/app/terminal_rendering/mod.rs"]
+mod selection_tests;
 
 #[cfg(test)]
-mod log_highlight_tests {
-    use super::*;
-
-    fn plain_run(text: &str, col: i32) -> HistSpan {
-        HistSpan {
-            text: text.to_string(),
-            fg: vt100::Color::Default,
-            bg: vt100::Color::Default,
-            bold: false,
-            inverse: false,
-            col,
-            cells: text.chars().count() as i32,
-        }
-    }
-
-    fn custom_rule(
-        pattern: &str,
-        regex: bool,
-        case_sensitive: bool,
-        whole_line: bool,
-        color: &str,
-    ) -> CompiledOutputRule {
-        compile_output_rules(&[OutputHighlightRule {
-            pattern: pattern.to_string(),
-            regex,
-            case_sensitive,
-            whole_line,
-            color: color.to_string(),
-            enabled: true,
-        }])
-        .pop()
-        .expect("test rule should compile")
-    }
-
-    #[test]
-    fn highlights_uppercase_level_and_preserves_columns() {
-        let runs = highlight_plain_output(
-            vec![plain_run(
-                "2026-07-14T10:20:30Z ERROR request failed",
-                0,
-            )],
-            OutputHighlightPreset::Log,
-            &[],
-        );
-        assert_eq!(runs.len(), 3);
-        assert_eq!(runs[1].text, "ERROR");
-        assert_eq!(runs[1].col, 21);
-        assert_eq!(runs[1].cells, 5);
-        assert!(runs[1].bold);
-        assert!(matches!(runs[1].fg, vt100::Color::Idx(9)));
-        assert_eq!(runs[2].col, 26);
-    }
-
-    #[test]
-    fn highlights_structured_lowercase_level_only() {
-        let json = r#"{"level":"warn","message":"disk nearly full"}"#;
-        let runs = highlight_plain_output(
-            vec![plain_run(json, 4)],
-            OutputHighlightPreset::Log,
-            &[],
-        );
-        let level = runs
-            .iter()
-            .find(|run| run.text == "warn")
-            .expect("structured level should be highlighted");
-        assert!(matches!(level.fg, vt100::Color::Idx(11)));
-
-        assert!(log_level_marker("an error occurred", 96).is_none());
-        assert!(log_level_marker("ERROR_CODE=5", 96).is_none());
-    }
-
-    #[test]
-    fn preserves_existing_ansi_styles() {
-        let mut coloured = plain_run("ERROR", 0);
-        coloured.fg = vt100::Color::Idx(2);
-        let runs = highlight_plain_output(vec![coloured], OutputHighlightPreset::Log, &[]);
-        assert_eq!(runs.len(), 1);
-        assert!(matches!(runs[0].fg, vt100::Color::Idx(2)));
-        assert!(!runs[0].bold);
-    }
-
-    #[test]
-    fn alternate_screen_does_not_add_log_colours() {
-        let mut parser = vt100::Parser::new(3, 30, 0);
-        parser.process(b"\x1b[?1049hERROR");
-        assert!(parser.screen().alternate_screen());
-        let (_plain, runs, _wrapped) = build_row(parser.screen(), 0, 30);
-        let level = runs
-            .iter()
-            .find(|run| run.text.contains("ERROR"))
-            .expect("alternate-screen text should still render");
-        assert!(matches!(level.fg, vt100::Color::Default));
-        assert!(!level.bold);
-    }
-
-    #[test]
-    fn off_preset_leaves_plain_levels_untouched() {
-        let runs = highlight_plain_output(
-            vec![plain_run("ERROR request failed", 0)],
-            OutputHighlightPreset::Off,
-            &[],
-        );
-        assert_eq!(runs.len(), 1);
-        assert!(matches!(runs[0].fg, vt100::Color::Default));
-        assert!(!runs[0].bold);
-    }
-
-    #[test]
-    fn devops_preset_adds_deployment_and_structured_states() {
-        let success = highlight_plain_output(
-            vec![plain_run("deploy SUCCESS", 0)],
-            OutputHighlightPreset::DevOps,
-            &[],
-        );
-        let token = success
-            .iter()
-            .find(|run| run.text == "SUCCESS")
-            .expect("DevOps success should be highlighted");
-        assert!(matches!(token.fg, vt100::Color::Idx(10)));
-
-        let json = highlight_plain_output(
-            vec![plain_run(r#"{"status":"failed"}"#, 0)],
-            OutputHighlightPreset::DevOps,
-            &[],
-        );
-        let token = json
-            .iter()
-            .find(|run| run.text == "failed")
-            .expect("structured DevOps state should be highlighted");
-        assert!(matches!(token.fg, vt100::Color::Idx(9)));
-
-        let conservative = highlight_plain_output(
-            vec![plain_run("deploy SUCCESS", 0)],
-            OutputHighlightPreset::Log,
-            &[],
-        );
-        assert_eq!(conservative.len(), 1);
-    }
-
-    #[test]
-    fn custom_literal_is_case_insensitive_and_overrides_builtin_colour() {
-        let rule = custom_rule("error", false, false, false, "green");
-        let runs = highlight_plain_output(
-            vec![plain_run("ERROR then error", 0)],
-            OutputHighlightPreset::Log,
-            &[rule],
-        );
-        let hits: Vec<_> = runs
-            .iter()
-            .filter(|run| matches!(run.fg, vt100::Color::Idx(10)))
-            .collect();
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].text, "ERROR");
-        assert_eq!(hits[1].text, "error");
-        assert!(!runs.iter().any(|run| matches!(run.fg, vt100::Color::Idx(9))));
-    }
-
-    #[test]
-    fn custom_regex_can_highlight_whole_line_without_overwriting_ansi() {
-        let rule = custom_rule(r"timeout|denied", true, false, true, "magenta");
-        let mut ansi = plain_run(" ANSI", 18);
-        ansi.fg = vt100::Color::Idx(2);
-        let runs = highlight_plain_output(
-            vec![plain_run("request timeout   ", 0), ansi],
-            OutputHighlightPreset::Log,
-            &[rule],
-        );
-        assert!(matches!(runs[0].fg, vt100::Color::Idx(13)));
-        assert!(runs[0].bold);
-        assert!(matches!(runs[1].fg, vt100::Color::Idx(2)));
-    }
-
-    #[test]
-    fn custom_unicode_match_preserves_terminal_grid_columns() {
-        let rule = custom_rule("错误", false, true, false, "red");
-        let text = "前缀错误 done";
-        let mut run = plain_run(text, 0);
-        run.cells = text_cell_width(text);
-        let runs = highlight_plain_output(
-            vec![run],
-            OutputHighlightPreset::Log,
-            &[rule],
-        );
-        let hit = runs
-            .iter()
-            .find(|run| run.text == "错误")
-            .expect("CJK keyword should be highlighted");
-        assert_eq!(hit.col, 4);
-        assert_eq!(hit.cells, 4);
-    }
-
-    #[test]
-    fn invalid_regex_is_rejected_before_persistence() {
-        assert!(validate_output_highlight_rule("([", true, false).is_err());
-        assert!(validate_output_highlight_rule("literal", false, false).is_ok());
-    }
-}
+#[path = "../tests/app/output_highlighting/mod.rs"]
+mod log_highlight_tests;
