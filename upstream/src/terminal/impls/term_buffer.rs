@@ -179,6 +179,57 @@ impl TermBuffer {
             .join("\n")
     }
 
+    /// Select the shell-oriented word at a visible grid position and return it.
+    /// Paths, host names and flags stay together; whitespace and shell control
+    /// punctuation delimit words (#287).
+    pub(crate) fn select_word_at(&mut self, row: u16, col: u16) -> Option<String> {
+        let line = self.displayed_text.get(row as usize)?;
+        let chars: Vec<char> = line.chars().collect();
+        let prefix = cell_prefix(&chars);
+        let at = char_at_cell_start(&prefix, col as usize);
+        let ch = *chars.get(at)?;
+        let is_word = |c: char| {
+            !c.is_whitespace()
+                && !matches!(
+                    c,
+                    '\'' | '"'
+                        | '`'
+                        | '|'
+                        | '&'
+                        | ';'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '<'
+                        | '>'
+                        | ','
+                )
+        };
+        if !is_word(ch) {
+            return None;
+        }
+        let mut start = at;
+        while start > 0 && is_word(chars[start - 1]) {
+            start -= 1;
+        }
+        let mut end = at + 1;
+        while end < chars.len() && is_word(chars[end]) {
+            end += 1;
+        }
+        let abs_row = self.vis_to_abs(row);
+        let start_col = prefix[start].min(u16::MAX as usize) as u16;
+        let end_col = prefix[end].saturating_sub(1).min(u16::MAX as usize) as u16;
+        let range = ((abs_row, start_col), (abs_row, end_col));
+        self.sel_ranges.clear();
+        self.sel_ranges.push(range);
+        self.sel_anchor = Some(range.0);
+        self.sel_focus = Some(range.1);
+        Some(chars[start..end].iter().collect())
+    }
+
     fn extract_range_text(&self, (ar, ac): (usize, u16), (fr, fc): (usize, u16)) -> String {
         let (lo_r, lo_c, hi_r, hi_c) = if (ar, ac) <= (fr, fc) {
             (ar, ac, fr, fc)
@@ -461,6 +512,15 @@ impl TermBuffer {
             }
             while self.history.len() > MAX_HISTORY {
                 self.history.pop_front();
+            }
+            // `view_offset` is measured backwards from the live bottom.  If
+            // output scrolls while the user is reading history, keeping the
+            // same offset would move their viewport forward by `k` rows. Move
+            // the offset back by the number of newly captured rows instead so
+            // the content under the scrollbar stays anchored (#306). At the
+            // live bottom (`0`) output-following remains unchanged.
+            if self.view_offset > 0 && k > 0 {
+                self.view_offset = self.view_offset.saturating_add(k).min(self.history.len());
             }
         }
         self.prev = curr;

@@ -236,6 +236,9 @@ export component QuickDockPanel inherits Rectangle {
 
 export component TerminalView inherits Rectangle {
     in property <bool> active: true;
+    in property <bool> zen-mode: false;
+    in property <float> terminal-line-spacing: 1.0;
+    in property <bool> extra-paste-shortcuts-enabled: true;
     in property <bool> quick-sidebar-enabled: false;
     in property <bool> quick-panel-docked: false;
     in property <string> quick-external-command;
@@ -272,10 +275,12 @@ export component TerminalView inherits Rectangle {
     in property <length> sftp-panel-height: 220px;
     in property <length> sftp-panel-width: 380px;     // extent when docked left/right
     in property <length> sftp-saved-height: 220px;    // height to restore on un-collapse
+    in property <length> sftp-tree-width: 160px;
     in property <bool>   sftp-collapsed: false;       // SFTP panel minimised (toolbar only)
     callback set-sftp-panel-height(length);
     callback set-sftp-panel-width(length);
     callback set-sftp-saved-height(length);
+    callback persist-sftp-tree-width(length);
     callback set-sftp-collapsed(bool);
 
     // --- SFTP docking (within the terminal area) ---------------------------
@@ -326,6 +331,8 @@ export component TerminalView inherits Rectangle {
     callback search-history(string /* query */);   // filter the history dropdown (#101)
 
     callback send-key(string, bool, bool, bool);
+    // Temporary on-device diagnostics for #312. Rust redacts printable text.
+    callback diagnose-key-event(string, bool, bool, bool, bool);
     callback cycle-tab(bool /* reverse */);
     callback terminal-resize(float, float);
     callback sftp-navigate(string);
@@ -368,6 +375,7 @@ export component TerminalView inherits Rectangle {
     callback select-start(int, int, bool, bool); // row, col, ctrl, shift
     callback select-update(int, int);       // extend drag-selection to (row, col)
     callback select-end();                  // finish selection → copy to clipboard
+    callback select-word(int, int);         // double-click word → select + copy (#287)
     callback select-autoscroll(int);        // auto-scroll while dragging past edge (dir: -1 up / +1 down)
 
     // Right-click context-menu anchor + find-bar visibility (private UI state).
@@ -388,6 +396,7 @@ export component TerminalView inherits Rectangle {
         if (root.active) {
             if (root.quick-external-send-enter) {
                 root.run-command(root.quick-external-command, root.send-to-all);
+                root.focus-pending = true;
             } else {
                 cmd-input.text = root.quick-external-command;
                 cmd-input.focus();
@@ -434,7 +443,7 @@ export component TerminalView inherits Rectangle {
     // minimum here is dangerous: if the spans fall back to a system font, a
     // mismatched cell-w garbles the grid.  Keep them derived from one source.)
     property <length> cell-w: max(1px, cell-probe.preferred-width / 50);
-    property <length> cell-h: max(1px, cell-probe.preferred-height);
+    property <length> cell-h: max(1px, cell-probe.preferred-height * root.terminal-line-spacing);
     // Usable text box = root.width minus the 10px left/right padding of
     // output-text; usable height = key-capture height minus the 8px top pad.
     // The old 16px bottom focus-recovery strip was redundant once body-touch
@@ -507,7 +516,8 @@ export component TerminalView inherits Rectangle {
 
         // --- Status strip ---------------------------------------------------
         Rectangle {
-            height: 24px;
+            visible: !root.zen-mode;
+            height: root.zen-mode ? 0px : 24px;
             background: Theme.bg-panel-alt;
             HorizontalLayout {
                 padding-left: 10px; padding-right: 10px;
@@ -542,11 +552,12 @@ export component TerminalView inherits Rectangle {
         // Side-docked SFTP needs enough room for its compact action row and a
         // usable path field. Clamp legacy/saved widths below that floor instead
         // of letting Slint squeeze controls out of alignment.
-        property <length> sf-w: root.sftp-collapsed ? 36px
+        property <length> sf-w: root.zen-mode ? 0px
+            : root.sftp-collapsed ? 36px
             : root.sftp-horizontal ? max(300px, root.sftp-panel-width)
             : root.sftp-panel-width;
-        property <length> sf-h: root.sftp-collapsed ? 36px : root.sftp-panel-height;
-        property <length> sp:   root.sftp-collapsed ? 0px : 4px;
+        property <length> sf-h: root.zen-mode ? 0px : root.sftp-collapsed ? 36px : root.sftp-panel-height;
+        property <length> sp: root.zen-mode || root.sftp-collapsed ? 0px : 4px;
         // The collapsed bar (sf-h) already reserves the bottom strip now.
         property <length> bottom-strip-h: 0px;
 
@@ -653,7 +664,7 @@ export component TerminalView inherits Rectangle {
                                             ev.modifiers.shift);
                                     }
                                 } else if (ev.kind == PointerEventKind.up) {
-                                    if (ev.button == PointerEventButton.middle) {
+                                    if (root.extra-paste-shortcuts-enabled && ev.button == PointerEventButton.middle) {
                                         root.paste-from-clipboard();
                                         ime-input.focus();
                                     } else if (ev.button == PointerEventButton.left
@@ -663,6 +674,11 @@ export component TerminalView inherits Rectangle {
                                         root.select-end();
                                     }
                                 }
+                            }
+                            double-clicked => {
+                                root.select-word(
+                                    floor(self.mouse-y / root.cell-h),
+                                    floor(self.mouse-x / root.cell-w));
                             }
                             moved => {
                                 if (root.selecting) {
@@ -814,7 +830,7 @@ export component TerminalView inherits Rectangle {
                                             ev.modifiers.shift);
                                     }
                                 } else if (ev.kind == PointerEventKind.up) {
-                                    if (ev.button == PointerEventButton.middle) {
+                                    if (root.extra-paste-shortcuts-enabled && ev.button == PointerEventButton.middle) {
                                         root.paste-from-clipboard();
                                         ime-input.focus();
                                     } else if (ev.button == PointerEventButton.left
@@ -824,6 +840,11 @@ export component TerminalView inherits Rectangle {
                                         root.select-end();
                                     }
                                 }
+                            }
+                            double-clicked => {
+                                root.select-word(
+                                    floor(self.mouse-y / root.cell-h),
+                                    floor(self.mouse-x / root.cell-w));
                             }
                             moved => {
                                 if (root.selecting) {
@@ -862,7 +883,7 @@ export component TerminalView inherits Rectangle {
                             width: 132px;
                             height: 132px;
                             Rectangle {
-                                background: Theme.bg-panel;
+                                background: Theme.popup-bg;
                                 border-radius: Theme.radius-sm;
                                 border-width: 1px;
                                 border-color: Theme.border-strong;
@@ -933,6 +954,9 @@ export component TerminalView inherits Rectangle {
                     // this reset an old blink phase can hide the cursor halfway
                     // through a repeated arrow-key sequence (#319).
                     key-capture.cursor-blink = true;
+                    root.diagnose-key-event(event.text,
+                        event.modifiers.control, event.modifiers.meta,
+                        event.modifiers.alt, event.modifiers.shift);
                     // ⚠ macOS modifier naming is SWAPPED by Slint (see the winit
                     // backend's muda.rs): `event.modifiers.control` is the **Cmd (⌘)**
                     // key and `event.modifiers.meta` is the **physical Ctrl** key.
@@ -959,6 +983,7 @@ export component TerminalView inherits Rectangle {
                         accept
                     // ── Copy: ⌘C (macOS, no Shift) / Ctrl+Shift+C ──
                     } else if (event.modifiers.control
+                            && (!event.modifiers.alt || root.extra-paste-shortcuts-enabled)
                             && (Theme.is-mac ? !event.modifiers.shift : event.modifiers.shift)
                             && (event.text == "c" || event.text == "C"
                                 || event.text == "\u{0003}")) {
@@ -974,7 +999,8 @@ export component TerminalView inherits Rectangle {
                         ime-input.focus();
                         accept
                     // ── Paste: Shift+Insert (the X11 / xterm paste convention) (#144) ──
-                    } else if (event.modifiers.shift && event.text == Key.Insert) {
+                    } else if (root.extra-paste-shortcuts-enabled
+                            && event.modifiers.shift && event.text == Key.Insert) {
                         root.paste-from-clipboard();
                         ime-input.focus();
                         accept
@@ -1045,7 +1071,7 @@ export component TerminalView inherits Rectangle {
                 y: 0;
                 width: parent.width;
                 height: 34px;
-                background: Theme.bg-panel;
+                background: Theme.popup-bg;
                 border-width: 1px;
                 border-color: Theme.border-strong;
                 border-radius: Theme.radius-sm;
@@ -1115,7 +1141,8 @@ export component TerminalView inherits Rectangle {
 
         // --- Command bar (#55): quick commands + input box + history ---------
         cmd-bar := Rectangle {
-            height: 34px;
+            visible: !root.zen-mode;
+            height: root.zen-mode ? 0px : 34px;
             background: Theme.bg-panel-alt;
             border-width: 0;
 
@@ -1176,12 +1203,14 @@ export component TerminalView inherits Rectangle {
                             root.run-command(self.text, root.send-to-all);
                             self.text = "";
                             root.history-cursor = -1;
+                            root.focus-pending = true;
                         }
                         key-pressed(e) => {
                             if (e.text == Key.Return && !e.modifiers.shift) {
                                 root.run-command(self.text, root.send-to-all);
                                 self.text = "";
                                 root.history-cursor = -1;
+                                root.focus-pending = true;
                                 accept
                             // ⌘R / Ctrl+R opens the searchable history dropdown and
                             // focuses its search box — full keyboard history recall
@@ -1298,6 +1327,7 @@ export component TerminalView inherits Rectangle {
                             root.run-command(cmd-input.text, root.send-to-all);
                             cmd-input.text = "";
                             root.history-cursor = -1;
+                            root.focus-pending = true;
                         }
                     }
                     send-row := HorizontalLayout {
@@ -1315,7 +1345,7 @@ export component TerminalView inherits Rectangle {
                 width: 420px;
                 height: min(320px, qc-col.preferred-height + 8px);
                 y: -self.height - 2px;
-                background: Theme.bg-panel;
+                background: Theme.popup-bg;
                 border-radius: Theme.radius-md;
                 border-width: 1px;
                 border-color: Theme.border-strong;
@@ -1374,7 +1404,7 @@ export component TerminalView inherits Rectangle {
                                     x: gmx; y: gmy; width: 150px;
                                     height: (q.orig-index == -1 ? 3 : 2) * 30px + 9px;
                                     Rectangle {
-                                        background: Theme.bg-panel; border-radius: Theme.radius-sm;
+                                        background: Theme.popup-bg; border-radius: Theme.radius-sm;
                                         border-width: 1px; border-color: Theme.border-strong;
                                         drop-shadow-blur: 10px; drop-shadow-color: #00000050;
                                         VerticalLayout {
@@ -1413,6 +1443,7 @@ export component TerminalView inherits Rectangle {
                                         if (q.send-enter) {
                                             // Send + execute (trailing Return).
                                             root.run-command(q.command, root.send-to-all);
+                                            root.focus-pending = true;
                                         } else {
                                             // Only fill the input box so it can be
                                             // tweaked before sending (B站 suggestion).
@@ -1443,7 +1474,7 @@ export component TerminalView inherits Rectangle {
                                     x: ctx-x; y: ctx-y; width: 160px;
                                     height: qpop-ctx-vl.preferred-height;
                                     Rectangle {
-                                        background: Theme.bg-panel; border-radius: Theme.radius-sm;
+                                        background: Theme.popup-bg; border-radius: Theme.radius-sm;
                                         border-width: 1px; border-color: Theme.border-strong;
                                         drop-shadow-blur: 10px; drop-shadow-color: #00000050;
                                         qpop-ctx-vl := VerticalLayout {
@@ -1544,7 +1575,7 @@ export component TerminalView inherits Rectangle {
                 width: 300px;
                 height: min(296px, 46px + max(28px, min(228px, h-col.preferred-height + 8px)));
                 y: -self.height - 2px;
-                background: Theme.bg-panel;
+                background: Theme.popup-bg;
                 border-radius: Theme.radius-md;
                 border-width: 1px;
                 border-color: Theme.border-strong;
@@ -1605,6 +1636,7 @@ export component TerminalView inherits Rectangle {
                                         clicked => {
                                             root.run-command(h, root.send-to-all);
                                             root.history-open = false;
+                                            root.focus-pending = true;
                                         }
                                     }
                                     Text { text: "\u{E037}"; font-family: "Material Icons";
@@ -1693,7 +1725,7 @@ export component TerminalView inherits Rectangle {
                                                     && root.history-selected < root.history-view.length) {
                                                 root.run-command(root.history-view[root.history-selected], root.send-to-all);
                                                 root.history-open = false;
-                                                ime-input.focus();
+                                                root.focus-pending = true;
                                             }
                                             accept
                                         } else {
@@ -1778,6 +1810,8 @@ export component TerminalView inherits Rectangle {
             width:  root.sftp-horizontal ? parent.sf-w : parent.width;
             height: root.sftp-horizontal ? parent.height : parent.sf-h;
             show-tree: !root.sftp-horizontal;   // hide the tree when narrow (vertical)
+            tree-width: root.sftp-tree-width;
+            persist-tree-width(width) => { root.persist-sftp-tree-width(width); }
             compact: root.sftp-collapsed && root.sftp-horizontal;  // clean strip when side+collapsed
             dock-drag-move(ax, ay) => {
                 root.sftp-panel-dragging = true;
