@@ -16,6 +16,10 @@ use crate::config::Session;
 use crate::i18n::t;
 use crate::ssh::{SessionCommand, SessionEvent, SessionHandle};
 
+#[cfg(windows)]
+const WSL_LOGIN_SHELL: &str = "shell=$(getent passwd \"$(id -un)\" 2>/dev/null | cut -d: -f7); \
+     [ -x \"$shell\" ] || shell=${SHELL:-/bin/sh}; exec \"$shell\" -l";
+
 pub fn spawn_local_session(
     runtime: &tokio::runtime::Handle,
     tab_id: String,
@@ -58,7 +62,7 @@ async fn run_local(
     initial_cols: u32,
     initial_rows: u32,
 ) -> Result<()> {
-    let (program, args) = local_program(&session.host);
+    let (program, args) = local_program(&session);
     let label = if session.name.trim().is_empty() {
         program.clone()
     } else {
@@ -152,7 +156,9 @@ async fn run_local(
                     pixel_height: 0,
                 });
             }
-            SessionCommand::AddTunnel { .. } | SessionCommand::StopTunnel(_) => {}
+            SessionCommand::AddTunnel { .. }
+            | SessionCommand::StopTunnel(_)
+            | SessionCommand::SetResourceMonitoring(_) => {}
             SessionCommand::KillProcess { reply, .. } => {
                 let _ = reply.send(crate::ssh::ProcessKillResult {
                     success: false,
@@ -172,8 +178,8 @@ async fn run_local(
     Ok(())
 }
 
-fn local_program(kind: &str) -> (String, Vec<String>) {
-    match kind {
+fn local_program(session: &Session) -> (String, Vec<String>) {
+    match session.host.as_str() {
         #[cfg(windows)]
         "cmd" => (
             "cmd.exe".to_string(),
@@ -184,7 +190,31 @@ fn local_program(kind: &str) -> (String, Vec<String>) {
             ],
         ),
         #[cfg(windows)]
-        "wsl" => ("wsl.exe".to_string(), Vec::new()),
+        "wsl" => {
+            let mut args = Vec::new();
+            if !session.local_distribution.trim().is_empty() {
+                args.push("--distribution".to_string());
+                args.push(session.local_distribution.clone());
+            }
+            args.push("--cd".to_string());
+            args.push(if session.local_working_dir.trim().is_empty() {
+                "~".to_string()
+            } else {
+                session.local_working_dir.clone()
+            });
+            // Do not rely on wsl.exe's implicit shell launch. In particular,
+            // Arch WSL installations whose passwd login shell is fish can open
+            // a PTY without ever presenting an interactive prompt (#352).
+            // Resolve the current Linux user's configured shell inside the
+            // distribution, then replace the temporary POSIX shell with it.
+            args.extend([
+                "--exec".to_string(),
+                "/bin/sh".to_string(),
+                "-lc".to_string(),
+                WSL_LOGIN_SHELL.to_string(),
+            ]);
+            ("wsl.exe".to_string(), args)
+        }
         #[cfg(windows)]
         "powershell" | _ => (
             "powershell.exe".to_string(),
@@ -205,16 +235,50 @@ fn local_program(kind: &str) -> (String, Vec<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::local_program;
+    use super::{local_program, WSL_LOGIN_SHELL};
+    use crate::config::Session;
 
     #[cfg(windows)]
     #[test]
     fn windows_shells_start_in_utf8_mode() {
-        let (_, ps_args) = local_program("powershell");
+        let mut session = Session::new_empty();
+        session.host = "powershell".to_string();
+        let (_, ps_args) = local_program(&session);
         assert!(ps_args.iter().any(|arg| arg.contains("OutputEncoding")));
         assert!(ps_args.iter().any(|arg| arg.contains("InputEncoding")));
 
-        let (_, cmd_args) = local_program("cmd");
+        session.host = "cmd".to_string();
+        let (_, cmd_args) = local_program(&session);
         assert!(cmd_args.iter().any(|arg| arg.contains("chcp 65001")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wsl_uses_distribution_and_home_by_default() {
+        let mut session = Session::new_empty();
+        session.host = "wsl".to_string();
+        session.local_distribution = "Ubuntu-24.04".to_string();
+        let (_, args) = local_program(&session);
+        assert_eq!(
+            args,
+            [
+                "--distribution",
+                "Ubuntu-24.04",
+                "--cd",
+                "~",
+                "--exec",
+                "/bin/sh",
+                "-lc",
+                WSL_LOGIN_SHELL,
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wsl_explicitly_starts_the_passwd_login_shell() {
+        assert!(WSL_LOGIN_SHELL.contains("getent passwd"));
+        assert!(WSL_LOGIN_SHELL.contains("exec \"$shell\" -l"));
+        assert!(!WSL_LOGIN_SHELL.contains("fish"));
     }
 }

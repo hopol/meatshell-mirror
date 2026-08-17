@@ -2,6 +2,26 @@ use serde::{Deserialize, Serialize};
 
 use super::{OutputHighlightRule, QuickCommand, Secret, Session};
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WslProfile {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub distribution: String,
+    #[serde(default = "default_wsl_home")]
+    pub directory: String,
+}
+
+fn default_wsl_home() -> String {
+    "~".to_string()
+}
+
+// Testing-stage MCP defaults. Switch these serde defaults to false before the
+// feature is promoted from preview to a stable release.
+fn default_mcp_preview_enabled() -> bool {
+    true
+}
+
 /// Ships with the "幻想 3048" sci-fi wallpaper on by default (a dark theme). New
 /// installs and users upgrading from before the wallpaper feature get it; once
 /// the user picks anything (including "无"/none, stored as ""), their choice is
@@ -52,6 +72,10 @@ pub(crate) fn default_quick_panel_height() -> f32 {
 pub struct ConfigFile {
     #[serde(default)]
     pub sessions: Vec<Session>,
+    /// User-managed WSL launch entries. An empty list keeps the implicit default
+    /// WSL entry for backwards compatibility.
+    #[serde(default)]
+    pub wsl_profiles: Vec<WslProfile>,
     /// Preset SFTP download directory. Empty = ask each time.
     #[serde(default)]
     pub download_dir: String,
@@ -93,6 +117,10 @@ pub struct ConfigFile {
     /// User-defined rules applied before the selected built-in preset.
     #[serde(default)]
     pub output_highlight_rules: Vec<OutputHighlightRule>,
+    /// Stored inverted so complete JSON lines are formatted and syntax-coloured
+    /// by default while still allowing users to preserve byte-for-byte display.
+    #[serde(default)]
+    pub json_format_disabled: bool,
     /// Global UI scale in percent (#100). 0 = default (100%).
     #[serde(default)]
     pub ui_scale: u32,
@@ -234,6 +262,19 @@ pub struct ConfigFile {
     /// it on stops the GitHub releases query and the banner.
     #[serde(default)]
     pub update_check_disabled: bool,
+    /// Enable the local stdio MCP server (`meatshell mcp serve`).
+    #[serde(default = "default_mcp_preview_enabled")]
+    pub mcp_enabled: bool,
+    /// Allow MCP tools to use credentials already stored by MeatShell. Secrets
+    /// remain internal and are never included in protocol responses.
+    #[serde(default = "default_mcp_preview_enabled")]
+    pub mcp_use_saved_credentials: bool,
+    /// Allow MCP clients to execute arbitrary commands on saved SSH sessions.
+    #[serde(default = "default_mcp_preview_enabled")]
+    pub mcp_allow_commands: bool,
+    /// Allow MCP clients to upload local files and download remote files.
+    #[serde(default = "default_mcp_preview_enabled")]
+    pub mcp_allow_file_transfers: bool,
     /// One-time default-layout migration marker (#new-user-defaults). 0 = config
     /// predates the migration. `migrate_defaults` bumps it to `DEFAULTS_REV` after
     /// pushing the new look (default wallpaper / welcome-as-sidebar / right-docked
