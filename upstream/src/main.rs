@@ -36,7 +36,7 @@ impl StartMode {
             _ if args.iter().any(|arg| arg == "--version" || arg == "-V") => Self::Version,
             _ => Self::App,
         }
-    }
+    } 
 }
 
 fn main() -> anyhow::Result<()> {
@@ -85,7 +85,8 @@ fn main() -> anyhow::Result<()> {
             // forwarded to the PTY via the `edited` callback.  The vim/Shift side-effects
             // are handled instead by the C0-marker + 3-layer Backspace filters in
             // `app::on_send_key`, so we no longer need (and must not use) ImmDisableIME.
-            app::run()
+            let intent = app::launch::parse(&args);
+            app::run(intent)
         }
         StartMode::Version => unreachable!("handled above"),
     }
