@@ -7,12 +7,11 @@
 //!   * Route Slint callbacks to the right domain module.
 mod auth_dialogs;
 pub(crate) mod core;
-#[cfg(target_os = "macos")]
-mod dock_menu;
 #[cfg(windows)]
 mod jump_list;
 pub mod launch;
 mod port_forward;
+mod session_trigger;
 mod quick_commands;
 mod resource_ui;
 mod session_event;
@@ -30,6 +29,7 @@ mod window;
 
 use self::auth_dialogs::*;
 use self::port_forward::*;
+use self::session_trigger::*;
 use self::quick_commands::*;
 use self::resource_ui::*;
 use self::session_event::*;
@@ -176,8 +176,9 @@ use crate::ssh::{
 use crate::terminal::c0_letter_key_down;
 use crate::terminal::{
     bare_ctrl_marker_workaround_enabled, cell_prefix, compile_output_rules,
-    encode_command_bar_input, encode_pasted_text, key_to_pty_bytes, paste_requires_large_review,
-    should_drop_bare_ctrl_marker, terminal_uses_bracketed_paste, CsiState, OutputHighlightPreset,
+    encode_command_bar_input, encode_pasted_text, is_terminal_interrupt, key_to_pty_bytes,
+    paste_requires_large_review, should_drop_bare_ctrl_marker, terminal_uses_bracketed_paste,
+    CsiState, OutputHighlightPreset,
     RenderGates, TabRenderGate, TermBuffer, TermBufferHandle, TermBuffers,
 };
 #[cfg(test)]
@@ -389,14 +390,6 @@ fn do_tab_render_flush(
 /// Number of samples kept for the sparkline.
 const NET_HISTORY_LEN: usize = 60;
 
-/// Set once by `run()`; lets a platform entry point outside the Slint
-/// callback tree (the macOS Dock menu) open a window. Only ever invoked from
-/// the UI/main thread.
-#[cfg(target_os = "macos")]
-thread_local! {
-    static NEW_WINDOW_HOOK: RefCell<Option<Rc<dyn Fn()>>> = RefCell::new(None);
-}
-
 // UI-thread handle to the process core, published by `run()` before the
 // event loop starts. Cross-thread callers (the single-instance IPC
 // listener) run a capture-less closure via `invoke_from_event_loop` and
@@ -404,22 +397,6 @@ thread_local! {
 // threads.
 thread_local! {
     static NEW_WINDOW_CORE: RefCell<Option<Rc<AppCore>>> = const { RefCell::new(None) };
-}
-
-#[cfg(target_os = "macos")]
-fn set_new_window_hook(f: Rc<dyn Fn()>) {
-    NEW_WINDOW_HOOK.with(|h| *h.borrow_mut() = Some(f));
-}
-
-/// Open a new window from a platform entry point (macOS Dock menu action).
-/// Runs on the main/UI thread; a no-op until `run()` installs the hook.
-#[cfg(target_os = "macos")]
-pub(crate) fn request_new_window() {
-    NEW_WINDOW_HOOK.with(|h| {
-        if let Some(f) = h.borrow().as_ref() {
-            f();
-        }
-    });
 }
 
 /// Embed the app icon PNG into the binary and set it as the X11 window icon.
@@ -564,33 +541,7 @@ pub fn run(intent: crate::app::launch::LaunchIntent) -> Result<()> {
     #[cfg(windows)]
     crate::app::jump_list::register_new_window_task();
 
-    // macOS Dock menu ("新建窗口"): install the new-window hook first so a
-    // Dock click can never race ahead of it. The NSApplication patching
-    // itself happens after the first window below, because AppKit asks the
-    // winit delegate for the Dock menu and that delegate only exists once
-    // the backend has built a window. Failures are warn-only and never
-    // block startup (see dock_menu.rs).
-    #[cfg(target_os = "macos")]
-    {
-        let core = core.clone();
-        set_new_window_hook(Rc::new(move || {
-            match open_window(core.clone(), true, None) {
-                Ok(window_id) => {
-                    if let Some(st) = core.window_states.borrow().get(&window_id) {
-                        if let Some(w) = st.weak.upgrade() {
-                            raise_to_front(&w);
-                        }
-                    }
-                }
-                Err(e) => tracing::warn!("failed to open new window: {e:#}"),
-            }
-        }));
-    }
-
     open_window(core.clone(), false, None)?;
-
-    #[cfg(target_os = "macos")]
-    crate::app::dock_menu::install_dock_menu();
 
     // Publish the core to the UI thread so the IPC listener's
     // invoke_from_event_loop closures can open windows without capturing the
@@ -1797,11 +1748,18 @@ fn open_window(
         window.on_set_welcome_as_sidebar(move |v| {
             // The property is two-way-bound through InterfacePanel and changing
             // it destroys/recreates the Welcome subtree that owns the Switch.
-            // Defer the *entire* transition until its callback has returned;
-            // deferring only refresh_panes still destroys the component tree
-            // recursively on Windows (#323).
+            // Persist first: saving config does not touch the Slint tree, and
+            // doing it synchronously means an immediate window close cannot
+            // lose the preference. Only the property/layout transition needs
+            // to wait until this Switch callback has returned (#323).
+            {
+                let mut s = store.borrow_mut();
+                s.set_welcome_as_sidebar(v);
+                if let Err(error) = s.save() {
+                    tracing::warn!("failed to persist welcome sidebar preference: {error:#}");
+                }
+            }
             let weak = weak.clone();
-            let store = store.clone();
             let layout = layout.clone();
             let content_size = content_size.clone();
             let tabs_model = tabs_model.clone();
@@ -1810,11 +1768,6 @@ fn open_window(
             slint::Timer::single_shot(std::time::Duration::ZERO, move || {
                 if let Some(w) = weak.upgrade() {
                     w.set_welcome_as_sidebar(v);
-                    {
-                        let mut s = store.borrow_mut();
-                        s.set_welcome_as_sidebar(v);
-                        let _ = s.save();
-                    }
                     {
                         let mut lay = layout.borrow_mut();
                         update_welcome_tab(&mut lay, v);
@@ -2295,7 +2248,7 @@ fn open_window(
     // --- In-app update check (#48) -----------------------------------------
     // "Download" on the banner opens the latest-release page in the browser.
     window.on_open_update_url(move || {
-        let url = "https://github.com/jeff141/meatshell/releases/latest";
+        let url = "https://github.com/yituorou/meatshell/releases/latest";
         #[cfg(windows)]
         let _ = std::process::Command::new("explorer").arg(url).spawn();
         #[cfg(target_os = "macos")]
@@ -2305,7 +2258,7 @@ fn open_window(
     });
     // The open-source link in the About dialog opens the project page.
     window.on_open_repo(move || {
-        let url = "https://github.com/jeff141/meatshell";
+        let url = "https://github.com/yituorou/meatshell";
         #[cfg(windows)]
         let _ = std::process::Command::new("explorer").arg(url).spawn();
         #[cfg(target_os = "macos")]
@@ -2327,7 +2280,7 @@ fn open_window(
         let weak = window.as_weak();
         std::thread::spawn(move || {
             let body =
-                match ureq::get("https://api.github.com/repos/jeff141/meatshell/releases/latest")
+                match ureq::get("https://api.github.com/repos/yituorou/meatshell/releases/latest")
                     .set("User-Agent", "meatshell-update-check")
                     .timeout(std::time::Duration::from_secs(8))
                     .call()
@@ -3579,6 +3532,10 @@ fn wire_session_callbacks(
     // Session.forwards; opening the dialog (new/edit) resets it.
     let edit_forwards: Rc<RefCell<Vec<PortFwd>>> =
         Rc::new(RefCell::new(vec![blank_forward_draft()]));
+    let edit_triggers: Rc<RefCell<Vec<TriggerDraft>>> =
+        Rc::new(RefCell::new(vec![blank_trigger_draft()]));
+    let edit_trigger_secrets: Rc<RefCell<Vec<Secret>>> =
+        Rc::new(RefCell::new(vec![Secret::default()]));
     // on_connect_session moves the panes_model binding into its closure; the
     // rename handler below needs its own handle, so clone up front.
     let panes_model_rename = panes_model.clone();
@@ -3608,12 +3565,17 @@ fn wire_session_callbacks(
     // New session -> open dialog with blank draft.
     let weak = window.as_weak();
     let ef_new = edit_forwards.clone();
+    let et_new = edit_triggers.clone();
+    let ets_new = edit_trigger_secrets.clone();
     let store_ng = store.clone();
     window.on_new_session_clicked(move || {
         if let Some(w) = weak.upgrade() {
             *ef_new.borrow_mut() = vec![blank_forward_draft()];
+            *et_new.borrow_mut() = vec![blank_trigger_draft()];
+            *ets_new.borrow_mut() = vec![Secret::default()];
             w.set_session_groups(session_groups_model(&store_ng.borrow()));
             w.set_dialog_forwards(forward_model(&ef_new.borrow()));
+            w.set_dialog_triggers(trigger_model(&et_new.borrow()));
             let empty = Session::new_empty();
             let (jump_labels, jump_ids, jump_idx) =
                 jump_candidates(&store_ng.borrow(), &empty.id, "");
@@ -3826,6 +3788,8 @@ fn wire_session_callbacks(
         let weak = window.as_weak();
         let store = store.clone();
         let ef_edit = edit_forwards.clone();
+        let et_edit = edit_triggers.clone();
+        let ets_edit = edit_trigger_secrets.clone();
         window.on_edit_session(move |id: SharedString| {
             let id = id.to_string();
             let store = store.borrow();
@@ -3836,9 +3800,16 @@ fn wire_session_callbacks(
             if ef_edit.borrow().is_empty() {
                 ef_edit.borrow_mut().push(blank_forward_draft());
             }
+            *et_edit.borrow_mut() = trigger_drafts(&session.triggers);
+            *ets_edit.borrow_mut() = session.triggers.iter().map(|t| t.response.clone()).collect();
+            if et_edit.borrow().is_empty() {
+                et_edit.borrow_mut().push(blank_trigger_draft());
+                ets_edit.borrow_mut().push(Secret::default());
+            }
             if let Some(w) = weak.upgrade() {
                 w.set_session_groups(session_groups_model(&store));
                 w.set_dialog_forwards(forward_model(&ef_edit.borrow()));
+                w.set_dialog_triggers(trigger_model(&et_edit.borrow()));
                 w.set_dialog_id(session.id.clone().into());
                 w.set_dialog_name(session.name.clone().into());
                 w.set_dialog_host(session.host.clone().into());
@@ -4167,6 +4138,8 @@ fn wire_session_callbacks(
         let store = store.clone();
         let sessions_model = sessions_model.clone();
         let edit_forwards = edit_forwards.clone();
+        let edit_triggers = edit_triggers.clone();
+        let edit_trigger_secrets = edit_trigger_secrets.clone();
         let registry = registry.clone();
         window.on_session_dialog_submit(move |draft: SessionDraft| {
             let id = draft.id.to_string();
@@ -4176,6 +4149,13 @@ fn wire_session_callbacks(
                     if let Some(w) = weak.upgrade() {
                         w.set_dialog_test_status(message.into());
                     }
+                    return;
+                }
+            };
+            let triggers = match validated_triggers(&edit_triggers.borrow(), &edit_trigger_secrets.borrow()) {
+                Ok(triggers) => triggers,
+                Err(message) => {
+                    if let Some(w) = weak.upgrade() { w.set_dialog_test_status(message.into()); }
                     return;
                 }
             };
@@ -4262,6 +4242,7 @@ fn wire_session_callbacks(
                 flow_control: draft.flow_control.to_string(),
                 encoding: draft.encoding.to_string(),
                 forwards,
+                triggers,
                 disable_shell_integration: draft.disable_shell_integration,
                 note: draft.note.to_string(),
                 jump_session_id: draft.jump_session_id.to_string(),
@@ -4289,6 +4270,8 @@ fn wire_session_callbacks(
         let runtime = runtime.clone();
         let store = store.clone();
         let edit_forwards = edit_forwards.clone();
+        let edit_triggers = edit_triggers.clone();
+        let edit_trigger_secrets = edit_trigger_secrets.clone();
         window.on_session_dialog_test(move |draft: SessionDraft| {
             let kind = draft.kind.to_string();
             if kind == "serial" {
@@ -4330,7 +4313,14 @@ fn wire_session_callbacks(
                     return;
                 }
             };
-            let session = session_from_draft(&draft, existing.as_ref(), forwards);
+            let triggers = match validated_triggers(&edit_triggers.borrow(), &edit_trigger_secrets.borrow()) {
+                Ok(triggers) => triggers,
+                Err(message) => {
+                    if let Some(w) = weak.upgrade() { w.set_dialog_test_status(message.into()); }
+                    return;
+                }
+            };
+            let session = session_from_draft(&draft, existing.as_ref(), forwards, triggers);
             let weak_done = weak.clone();
 
             if kind == "ssh" {
@@ -4460,19 +4450,11 @@ fn wire_session_callbacks(
     {
         let weak = window.as_weak();
         window.on_session_dialog_pick_key(move || {
-            let mut dialog = rfd::FileDialog::new()
-                .set_title(t("选择私钥文件", "Choose private key file"));
-            // OpenSSH's standard macOS key names (id_ed25519, id_rsa, …) have
-            // no extension. A native macOS extension filter makes those files
-            // visible but disabled, so leave the picker unfiltered there (#325).
-            // Other platforms retain the narrower existing filter.
-            #[cfg(not(target_os = "macos"))]
-            {
-                dialog = dialog.add_filter(
-                    t("SSH 私钥", "SSH private keys"),
-                    &["ppk", "pem", "key"],
-                );
-            }
+            let mut dialog =
+                rfd::FileDialog::new().set_title(t("选择私钥文件", "Choose private key file"));
+            // OpenSSH's standard key names (id_ed25519, id_rsa, …) usually
+            // have no extension. Extension filters hide or disable those files
+            // in native pickers, so show every file on every platform (#393).
             // Start in ~/.ssh if it exists.
             if let Some(home) = directories::UserDirs::new().map(|u| u.home_dir().join(".ssh")) {
                 if home.is_dir() {
@@ -4528,6 +4510,47 @@ fn wire_session_callbacks(
             }
             if let Some(w) = weak.upgrade() {
                 w.set_dialog_forwards(forward_model(&ef.borrow()));
+            }
+        });
+    }
+
+    // Session expect/send trigger editor (#212).
+    {
+        let weak = window.as_weak();
+        let triggers = edit_triggers.clone();
+        let secrets = edit_trigger_secrets.clone();
+        window.on_add_trigger(move || {
+            triggers.borrow_mut().push(blank_trigger_draft());
+            secrets.borrow_mut().push(Secret::default());
+            if let Some(w) = weak.upgrade() {
+                w.set_dialog_triggers(trigger_model(&triggers.borrow()));
+            }
+        });
+    }
+    {
+        let triggers = edit_triggers.clone();
+        window.on_update_trigger(move |index: i32, trigger: TriggerDraft| {
+            let i = index as usize;
+            let mut values = triggers.borrow_mut();
+            if i < values.len() { values[i] = trigger; }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let triggers = edit_triggers.clone();
+        let secrets = edit_trigger_secrets.clone();
+        window.on_delete_trigger(move |index: i32| {
+            let i = index as usize;
+            let mut values = triggers.borrow_mut();
+            let mut saved = secrets.borrow_mut();
+            if i < values.len() { values.remove(i); }
+            if i < saved.len() { saved.remove(i); }
+            if values.is_empty() {
+                values.push(blank_trigger_draft());
+                saved.push(Secret::default());
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_dialog_triggers(trigger_model(&values));
             }
         });
     }
@@ -5679,7 +5702,8 @@ fn wire_key_input(
             if !ctrl && !alt {
                 if let Some(c) = key.as_str().chars().next() {
                     let cp = c as u32;
-                    let is_standalone = matches!(cp, 0x08 | 0x09 | 0x0A | 0x0D | 0x1B);
+                    let is_standalone = matches!(cp, 0x08 | 0x09 | 0x0A | 0x0D | 0x1B)
+                        || is_terminal_interrupt(key.as_str());
                     if key.as_str().chars().count() == 1
                         && (0x01..=0x1f).contains(&cp)
                         && !is_standalone
@@ -5721,7 +5745,8 @@ fn wire_key_input(
                     // because the user never pressed M.  Without this exemption
                     // the filter would silently drop the Enter, making it
                     // impossible to confirm nano's "File Name to Write:" prompt.
-                    let always_pass = matches!(cp, 0x09 | 0x0a | 0x0d);
+                    let always_pass = matches!(cp, 0x09 | 0x0a | 0x0d)
+                        || is_terminal_interrupt(key.as_str());
                     if !always_pass
                         && key.as_str().chars().count() == 1
                         && (0x01..=0x1a).contains(&cp)

@@ -18,7 +18,7 @@ import { Theme } from "theme.slint";
 import { Sidebar, DiskInfo } from "sidebar.slint";
 import { TabBar, TabInfo } from "tabs.slint";
 import { Welcome, SessionInfo } from "welcome.slint";
-import { SessionDialog, SessionDraft, PortFwd } from "session_dialog.slint";
+import { SessionDialog, SessionDraft, PortFwd, TriggerDraft } from "session_dialog.slint";
 import { ConfirmDialog } from "confirm_dialog.slint";
 import { LabeledInput, PrimaryButton, GhostButton, DockExpandButton, IconButton, ToolStrip } from "widgets.slint";
 import { TerminalView, TermSpan, TermMatch, QuickCmd, QuickDockPanel } from "terminal_view.slint";
@@ -664,6 +664,9 @@ export component AppWindow inherits Window {
     in-out property <string> editor-content;  // text, two-way with the input
     in-out property <bool> editor-readonly;   // view = true, edit = false
     in-out property <bool> editor-dirty: false; // edited since load
+    // Opening the dynamic editor and focusing its TextInput in the same event
+    // can re-enter Windows AccessKit while it is registering the new item tree.
+    property <bool> editor-focus-pending: false;
     in-out property <string> editor-line-numbers; // newline-joined "1..N" from Rust (#81)
     in-out property <string> editor-find-query;
     in-out property <string> editor-replace-text;
@@ -780,9 +783,13 @@ export component AppWindow inherits Window {
     callback session-dialog-pick-key();
     // Port forwards for the session being edited (#56).
     in-out property <[PortFwd]> dialog-forwards;
+    in-out property <[TriggerDraft]> dialog-triggers;
     callback add-forward();
     callback update-forward(int /* index */, PortFwd);
     callback delete-forward(int /* index */);
+    callback add-trigger();
+    callback update-trigger(int /* index */, TriggerDraft);
+    callback delete-trigger(int /* index */);
 
     callback tab-selected(string);
     callback tab-closed(string);
@@ -2383,10 +2390,9 @@ export component AppWindow inherits Window {
                     Rectangle { height: 1px; background: Theme.border-subtle; }
 
                     // Text area: a line-number gutter on the left + the editor.
-                    // word-wrap is OFF so one logical line == one display line and
-                    // the numbers line up (long lines scroll horizontally); the
-                    // gutter is pinned horizontally but tracks the editor's
-                    // vertical scroll via ed-scroll.viewport-y (#81).
+                    // Wrap long lines to the visible editor width so text and
+                    // selection painting cannot overflow to the right (#387).
+                    // The gutter stays pinned and follows vertical scrolling.
                     Rectangle {
                         vertical-stretch: 1;
                         background: Theme.bg-root;
@@ -2408,26 +2414,59 @@ export component AppWindow inherits Window {
                                 }
                             }
                             Rectangle { width: 1px; background: Theme.border-subtle; }
-                            ed-scroll := ScrollView {
-                                viewport-width: max(self.visible-width, edit-input.preferred-width + 16px);
-                                viewport-height: max(self.visible-height, edit-input.preferred-height + 16px);
-                                edit-input := TextInput {
-                                    x: 8px;
-                                    y: 8px;
-                                    width: max(parent.visible-width - 16px, self.preferred-width);
-                                    height: self.preferred-height;
-                                    text <=> root.editor-content;
-                                    read-only: root.editor-readonly;
-                                    single-line: false;
-                                    wrap: no-wrap;
-                                    color: Theme.text-primary;
-                                    font-family: Theme.ui-font-family;
-                                    font-size: Theme.fs-md;
-                                    edited => {
-                                        root.editor-dirty = true;
-                                        root.editor-recount(root.editor-content);
-                                        root.editor-match-count = root.editor-count-matches(
-                                            root.editor-content, root.editor-find-query);
+                            editor-viewport := Rectangle {
+                                horizontal-stretch: 1;
+                                clip: true;
+                                // TextInput owns the pointer grab while selecting
+                                // and ignores wheel events. Catch the rejected
+                                // wheel behind it and scroll the editor (#388).
+                                editor-wheel := TouchArea {
+                                    scroll-event(event) => {
+                                        ed-scroll.viewport-y = clamp(
+                                            ed-scroll.viewport-y + event.delta-y,
+                                            min(0px, ed-scroll.visible-height - ed-scroll.viewport-height),
+                                            0px);
+                                        accept
+                                    }
+                                }
+                                ed-scroll := ScrollView {
+                                    viewport-width: self.visible-width;
+                                    viewport-height: max(self.visible-height, edit-input.preferred-height + 16px);
+                                    edit-input := TextInput {
+                                        x: 8px;
+                                        y: 8px;
+                                        width: max(1px, ed-scroll.visible-width - 16px);
+                                        height: max(ed-scroll.visible-height - 16px, self.preferred-height);
+                                        text <=> root.editor-content;
+                                        read-only: root.editor-readonly;
+                                        single-line: false;
+                                        wrap: char-wrap;
+                                        color: Theme.text-primary;
+                                        font-family: Theme.ui-font-family;
+                                        font-size: Theme.fs-md;
+                                        page-height: ed-scroll.visible-height;
+                                        cursor-position-changed(position) => {
+                                            // Keep a keyboard/drag selection endpoint
+                                            // visible. During a pointer grab this also
+                                            // advances the viewport as the mouse moves
+                                            // beyond its top or bottom edge (#388).
+                                            let cursor-y = position.y + self.y + ed-scroll.viewport-y;
+                                            if (cursor-y < 12px) {
+                                                ed-scroll.viewport-y = min(0px,
+                                                    ed-scroll.viewport-y + 12px - cursor-y);
+                                            } else if (cursor-y > ed-scroll.visible-height - 12px) {
+                                                ed-scroll.viewport-y = max(
+                                                    min(0px, ed-scroll.visible-height - ed-scroll.viewport-height),
+                                                    ed-scroll.viewport-y
+                                                        - (cursor-y - ed-scroll.visible-height + 12px));
+                                            }
+                                        }
+                                        edited => {
+                                            root.editor-dirty = true;
+                                            root.editor-recount(root.editor-content);
+                                            root.editor-match-count = root.editor-count-matches(
+                                                root.editor-content, root.editor-find-query);
+                                        }
                                     }
                                 }
                             }
@@ -2470,8 +2509,18 @@ export component AppWindow inherits Window {
                     }
                 }
             }
-            // Focus the text the moment the editor opens.
-            init => { edit-input.focus(); }
+            // Defer focus until the next UI turn. Focusing directly from init
+            // re-enters Slint's Windows accessibility adapter and can panic
+            // with "RefCell already borrowed" (#386).
+            init => { root.editor-focus-pending = true; }
+            editor-focus-timer := Timer {
+                interval: 0ms;
+                running: root.editor-focus-pending;
+                triggered => {
+                    root.editor-focus-pending = false;
+                    edit-input.focus();
+                }
+            }
         }
     }
 
@@ -3934,7 +3983,7 @@ export component AppWindow inherits Window {
                             HorizontalLayout {
                                 padding-left: 4px; padding-right: 4px;
                                 Text {
-                                    text: "github.com/jeff141/meatshell";
+                                    text: "github.com/yituorou/meatshell";
                                     color: Theme.accent;
                                     font-size: Theme.fs-sm;
                                     vertical-alignment: center;
@@ -3992,6 +4041,7 @@ export component AppWindow inherits Window {
         draft-note <=> root.dialog-note;
         test-status <=> root.dialog-test-status;
         forwards: root.dialog-forwards;
+        triggers: root.dialog-triggers;
         submit(draft) => { root.session-dialog-submit(draft); }
         test-connection(draft) => { root.session-dialog-test(draft); }
         cancel => { root.session-dialog-cancel(); }
@@ -3999,6 +4049,9 @@ export component AppWindow inherits Window {
         add-forward => { root.add-forward(); }
         update-forward(i, f) => { root.update-forward(i, f); }
         delete-forward(i) => { root.delete-forward(i); }
+        add-trigger => { root.add-trigger(); }
+        update-trigger(i, trigger) => { root.update-trigger(i, trigger); }
+        delete-trigger(i) => { root.delete-trigger(i); }
     }
 
     // --- Delete confirmation (#28) ----------------------------------------
@@ -4026,14 +4079,15 @@ export component AppWindow inherits Window {
     }
 
     // Multi-line paste can execute several shell commands at once. Keep the
-    // prompt explicit and require a button click; clicking the backdrop never
-    // accepts the paste (#262).
+    // prompt explicit; clicking the backdrop never accepts the paste (#262),
+    // while Enter provides the expected keyboard confirmation (#392).
     ConfirmDialog {
         width: parent.width;
         height: parent.height;
         is-open <=> root.paste-confirm-open;
         covered: root.confirm-close-open;
         dismiss-on-backdrop: false;
+        confirm-on-enter: true;
         title: root.lang-en ? "Confirm multi-line paste" : "确认多行粘贴";
         message: root.lang-en
             ? "The clipboard contains line breaks and may execute multiple commands. Review it before pasting."
