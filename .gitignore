@@ -1,6 +1,5 @@
 # 依赖目录
 node_modules/
-vendor/
 target/
 
 # 构建产物
