@@ -1073,6 +1073,30 @@ impl ConfigStore {
         self.cache.wsl_profiles.retain(|profile| profile.id != id);
     }
 
+    pub fn custom_agents(&self) -> &[CustomAgent] {
+        &self.cache.custom_agents
+    }
+
+    /// Add a user-defined agent launcher (#427). Returns false (and adds
+    /// nothing) when the name or command is blank.
+    pub fn add_custom_agent(&mut self, name: &str, command: &str, directory: &str) -> bool {
+        let (name, command) = (name.trim(), command.trim());
+        if name.is_empty() || command.is_empty() {
+            return false;
+        }
+        self.cache.custom_agents.push(CustomAgent {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            command: command.to_string(),
+            directory: directory.trim().to_string(),
+        });
+        true
+    }
+
+    pub fn remove_custom_agent(&mut self, id: &str) {
+        self.cache.custom_agents.retain(|agent| agent.id != id);
+    }
+
     pub fn quick_panel_open(&self) -> bool {
         self.cache.quick_panel_open
     }
@@ -1584,7 +1608,8 @@ impl ConfigStore {
     /// folder so expanding one folder does not accidentally expand the rest.
     pub fn set_session_group_collapsed(&mut self, name: &str, collapsed: bool) {
         if self.cache.collapsed_session_groups.is_none() {
-            let mut groups = vec!["system".to_string()];
+            // Built-in groups: local shells, and the detected agent CLIs (#427).
+            let mut groups = vec!["system".to_string(), "agents".to_string()];
             if self
                 .cache
                 .sessions

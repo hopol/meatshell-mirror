@@ -16,7 +16,7 @@ import "fonts/MaterialIcons-Regular.ttf";
 
 import { Theme } from "theme.slint";
 import { Sidebar, DiskInfo } from "sidebar.slint";
-import { TabBar, TabInfo } from "tabs.slint";
+import { TabBar, TabInfo, LaunchItem } from "tabs.slint";
 import { Welcome, SessionInfo } from "welcome.slint";
 import { SessionDialog, SessionDraft, PortFwd, TriggerDraft, JumpHop } from "session_dialog.slint";
 import { ConfirmDialog } from "confirm_dialog.slint";
@@ -27,12 +27,12 @@ import { SftpEntry, SftpTreeNode, TunnelInfo } from "sftp_panel.slint";
 import { ProcWindow, ProcRow } from "proc_window.slint";
 import { SystemInfoWindow, SysInfoRow, SysMetricRow, SysNetRow } from "system_info_window.slint";
 import { EditorWindow, EditorFindResult } from "editor_window.slint";
-import { InterfacePanel, OutputRuleItem, WslProfileInfo } from "interface_panel.slint";
+import { InterfacePanel, OutputRuleItem, WslProfileInfo, CustomAgentInfo } from "interface_panel.slint";
 // Re-export so `slint::include_modules!` generates the detached Rust window types.
 export { ProcWindow, SystemInfoWindow, EditorWindow }
 import { ComboBox, SpinBox, LineEdit, Button, ScrollView, CheckBox, Palette } from "std-widgets.slint";
 
-export { SessionInfo, SessionDraft, JumpHop, TabInfo, SftpEntry, SftpTreeNode, TunnelInfo, QuickCmd, PortFwd, WslProfileInfo }
+export { SessionInfo, LaunchItem, SessionDraft, JumpHop, TabInfo, SftpEntry, SftpTreeNode, TunnelInfo, QuickCmd, PortFwd, WslProfileInfo, CustomAgentInfo }
 
 // --- TerminalState ---------------------------------------------------------
 // Per-terminal view-model exposed to Rust. A TabInfo has the metadata; the
@@ -607,6 +607,10 @@ export component AppWindow inherits Window {
     // every time the modal opens so coordinates from a larger/DPI-different
     // monitor can never leave the settings card outside the current window.
     changed interface-open => {
+        // A later open from the toolbar starts on the first page again.
+        if (!root.interface-open) {
+            root.interface-start-page = "font";
+        }
         if (root.interface-open) {
             root.ifd-dragging = false;
             root.ifd-resizing = false;
@@ -795,12 +799,22 @@ export component AppWindow inherits Window {
     callback cancel-transfer(string);        // cancel an in-progress transfer by id (#100)
     callback set-language(string);           // switch UI language ("zh" / "en")
 
-    // --- Update check (#48) ------------------------------------------------
-    // Set by Rust after a background GitHub-releases query; purely informational
-    // (the app keeps working on the current version).
+    // --- Updates ----------------------------------------------------------
     in-out property <bool> update-available: false;
-    in property <string> update-version;     // e.g. "v0.3.3"
-    callback open-update-url();              // open the release page in a browser
+    in property <string> update-version;
+    in property <bool> update-busy;
+    in property <bool> update-ready;
+    in property <bool> update-error;
+    in property <bool> update-install-supported;
+    in property <string> update-status;
+    property <string> update-action-label: root.update-ready
+        ? (root.lang-en ? "Install and restart" : "安装并重启")
+        : root.update-install-supported
+            ? (root.lang-en ? "Download update" : "下载更新")
+            : (root.lang-en ? "Release page" : "发布页面");
+    callback check-for-updates();
+    callback update-action();
+    callback open-update-url();
 
     // --- Built-in file viewer/editor (#70) --------------------------------
     in-out property <bool> editor-open: false;
@@ -852,6 +866,21 @@ export component AppWindow inherits Window {
 
     // --- Session list ------------------------------------------------------
     in property <[SessionInfo]> sessions;
+    // New-tab launch menu (#427): local shells and the agent CLIs found here.
+    in property <[LaunchItem]> launch-shells;
+    in property <[LaunchItem]> agents;
+    // Settings → AI agents: user-defined launchers for undetected agents.
+    in property <[CustomAgentInfo]> custom-agents;
+    in-out property <string> agent-new-name;
+    in-out property <string> agent-new-command;
+    in-out property <string> agent-new-directory;
+    callback add-custom-agent(string, string, string);
+    callback remove-custom-agent(string);
+    callback pick-agent-directory();
+    // Rebuild the launch menu, the "agents" group and the settings list.
+    callback refresh-agent-launchers();
+    // Settings page to show when the panel opens (see InterfacePanel).
+    in-out property <string> interface-start-page: "font";
     // Bumped by Rust whenever the sessions model is rebuilt wholesale
     // (set_vec). A rebuild destroys the dragging row's pointer grab, so
     // Welcome watches this to clear its shared drag state instead of
@@ -943,6 +972,8 @@ export component AppWindow inherits Window {
     in-out property <bool> dialog-vt100-drawing: false;
     in-out property <string> dialog-session-log: "default";
     in-out property <bool> dialog-disable-shell-integration: false;
+    in-out property <string> dialog-sftp-mode: "";
+    in-out property <string> dialog-sftp-command: "";
     in-out property <string> dialog-note;
     in-out property <string> dialog-test-status;
 
@@ -1116,6 +1147,7 @@ export component AppWindow inherits Window {
     callback sftp-navigate(string /* tab-id */, string /* path */);
     // Trigger a download: Rust opens a save-folder dialog then transfers.
     callback sftp-download(string /* tab-id */, string /* remote-path */);
+    callback sftp-open-file(string /* tab-id */, string /* remote-path */);   // (#493)
     // Trigger an upload: Rust opens a file-picker dialog then transfers.
     callback sftp-upload-clicked(string /* tab-id */, string /* remote-dir */, bool /* folder */);
     // Refresh the current directory listing.
@@ -1844,6 +1876,8 @@ export component AppWindow inherits Window {
                         // this row so tabs don't slide underneath them (#122).
                         reserve-right: pane.reserve-right;
                         show-new-tab: !root.welcome-as-sidebar;
+                        launch-shells: root.launch-shells;
+                        launch-agents: root.agents;
                         can-merge-pane: root.panes.length > 1;
                         tabs: pane.tabs;
                         active-id: pane.active-id;
@@ -1857,6 +1891,17 @@ export component AppWindow inherits Window {
                         tab-selected(id) => { root.pane-tab-selected(pane.id, id); }
                         tab-closed(id) => { root.pane-tab-closed(pane.id, id); }
                         new-tab() => { root.pane-new-tab(pane.id); }
+                        launch(id) => {
+                            // Open it in this pane: connect-session adds the tab
+                            // to the focused pane.
+                            root.pane-focus(pane.id);
+                            root.connect-session(id);
+                        }
+                        customize-agents => {
+                            root.interface-start-page = "agents";
+                            root.settings-open = false;
+                            root.interface-open = true;
+                        }
                         tab-move(from-index, to-index) => {
                             root.tab-drag-live = false;
                             root.pane-tab-move(pane.id, from-index, to-index);
@@ -2058,6 +2103,7 @@ export component AppWindow inherits Window {
                         terminal-resize(w, h) => { root.terminal-resize(term.id, w, h) }
                         sftp-navigate(path) => { root.sftp-navigate(term.id, path); }
                         sftp-download(path) => { root.sftp-download(term.id, path); }
+                        sftp-open-file(path) => { root.sftp-open-file(term.id, path); }
                         sftp-upload-clicked(dir, folder) => { root.sftp-upload-clicked(term.id, dir, folder); }
                         sftp-refresh(path) => { root.sftp-refresh(term.id, path); }
                         sftp-tree-expand(path) => { root.sftp-tree-expand(term.id, path); }
@@ -2679,14 +2725,12 @@ export component AppWindow inherits Window {
         }
     }
 
-    // --- Update-available banner (#48) ------------------------------------
-    // A dismissible top-centre banner; the app stays usable on the current
-    // version. "Download" opens the GitHub release page in the browser.
+    // A dismissible banner shares update actions with the settings page.
     if root.update-available : Rectangle {
-        x: (parent.width - 384px) / 2;
+        x: (parent.width - self.width) / 2;
         y: 8px;
-        width: 384px;
-        height: 38px;
+        width: min(560px, parent.width - 16px);
+        height: 44px;
         background: Theme.accent;
         border-radius: Theme.radius-md;
         border-width: 1px;
@@ -2698,7 +2742,9 @@ export component AppWindow inherits Window {
             padding-right: 6px;
             spacing: 8px;
             Text {
-                text: "🎉 " + @tr("Update available:") + " " + root.update-version;
+                text: root.update-busy ? root.update-status
+                    : root.update-error ? (root.lang-en ? "Update failed — see Settings" : "更新失败，请查看设置")
+                    : "🎉 " + @tr("Update available:") + " " + root.update-version;
                 color: #ffffff;
                 font-size: Theme.fs-sm;
                 font-family: Theme.ui-font-family;
@@ -2707,15 +2753,17 @@ export component AppWindow inherits Window {
                 overflow: elide;
             }
             Rectangle {
-                width: 68px; height: 26px;
+                width: root.lang-en ? 142px : 100px; height: 28px;
                 y: (parent.height - self.height) / 2;
                 border-radius: Theme.radius-sm;
                 background: upd-dl-ta.has-hover ? #ffffff45 : #ffffff28;
                 upd-dl-ta := TouchArea {
+                    enabled: !root.update-busy;
                     mouse-cursor: pointer;
-                    clicked => { root.open-update-url(); }
+                    clicked => { root.update-action(); }
                 }
-                Text { text: @tr("Download"); color: #ffffff; font-size: Theme.fs-sm;
+                opacity: root.update-busy ? 0.55 : 1;
+                Text { text: root.update-action-label; color: #ffffff; font-size: Theme.fs-sm;
                        horizontal-alignment: center; vertical-alignment: center; }
             }
             Rectangle {
@@ -4742,6 +4790,8 @@ export component AppWindow inherits Window {
         draft-vt100-drawing <=> root.dialog-vt100-drawing;
         draft-session-log <=> root.dialog-session-log;
         draft-disable-shell-integration <=> root.dialog-disable-shell-integration;
+        draft-sftp-mode <=> root.dialog-sftp-mode;
+        draft-sftp-command <=> root.dialog-sftp-command;
         draft-note <=> root.dialog-note;
         test-status <=> root.dialog-test-status;
         forwards: root.dialog-forwards;
@@ -5220,6 +5270,15 @@ export component AppWindow inherits Window {
                     welcome-as-sidebar <=> root.welcome-as-sidebar;
                     quick-commands-as-sidebar <=> root.quick-commands-as-sidebar;
                     update-check-enabled <=> root.update-check-enabled;
+                    update-version: root.update-version;
+                    update-busy: root.update-busy;
+                    update-error: root.update-error;
+                    update-install-supported: root.update-install-supported;
+                    update-status: root.update-status;
+                    update-action-label: root.update-action-label;
+                    check-for-updates => { root.check-for-updates(); }
+                    update-action => { root.update-action(); }
+                    open-update-url => { root.open-update-url(); }
                     mcp-enabled <=> root.mcp-enabled;
                     mcp-use-saved-credentials <=> root.mcp-use-saved-credentials;
                     mcp-allow-commands <=> root.mcp-allow-commands;
@@ -5229,6 +5288,11 @@ export component AppWindow inherits Window {
                     custom-wallpaper-name: root.custom-wallpaper-name;
                     wsl-profiles: root.wsl-profiles;
                     wsl-new-directory <=> root.wsl-new-directory;
+                    start-page: root.interface-start-page;
+                    custom-agents: root.custom-agents;
+                    agent-new-name <=> root.agent-new-name;
+                    agent-new-command <=> root.agent-new-command;
+                    agent-new-directory <=> root.agent-new-directory;
                     set-wallpaper(v) => { root.set-wallpaper(v); }
                     pick-wallpaper-file() => { root.pick-wallpaper-file(); }
                     set-term-font(v) => { root.set-term-font(v); }
@@ -5287,6 +5351,9 @@ export component AppWindow inherits Window {
                     add-wsl-profile(name, distribution, directory) => { root.add-wsl-profile(name, distribution, directory); }
                     remove-wsl-profile(id) => { root.remove-wsl-profile(id); }
                     pick-wsl-directory => { root.pick-wsl-directory(); }
+                    add-custom-agent(name, command, directory) => { root.add-custom-agent(name, command, directory); }
+                    remove-custom-agent(id) => { root.remove-custom-agent(id); }
+                    pick-agent-directory => { root.pick-agent-directory(); }
                     persist-wallpaper-overlay(v) => { root.persist-wallpaper-overlay(v); }
                 }
             }
