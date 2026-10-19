@@ -26,7 +26,8 @@ import { TerminalView, TermSpan, TermMatch, QuickCmd, QuickDockPanel } from "ter
 import { SftpEntry, SftpTreeNode, TunnelInfo } from "sftp_panel.slint";
 import { ProcWindow, ProcRow } from "proc_window.slint";
 import { SystemInfoWindow, SysInfoRow, SysMetricRow, SysNetRow } from "system_info_window.slint";
-import { EditorWindow, EditorFindResult } from "editor_window.slint";
+import { EditorWindow } from "editor_window.slint";
+import { EditorPane, EditorFindResult, EditorDoc } from "editor_pane.slint";
 import { InterfacePanel, OutputRuleItem, WslProfileInfo, CustomAgentInfo } from "interface_panel.slint";
 // Re-export so `slint::include_modules!` generates the detached Rust window types.
 export { ProcWindow, SystemInfoWindow, EditorWindow }
@@ -398,7 +399,7 @@ export component AppWindow inherits Window {
     // macOS immersive title bar: Rust makes the native bar transparent and lets
     // content render under it, so we reserve this much space at the top for the
     // traffic-light buttons + a clean drag strip (0 elsewhere). See setup_macos_platform.
-    property <length> titlebar-inset: root.is-mac ? 28px : 0px;
+    property <length> titlebar-inset: root.is-mac && !root.term-fullscreen ? 28px : 0px;
     in-out property <bool> window-maximized: false;
     // Rust disables live model updates while the native window is unfocused,
     // minimized or occluded. Cached samples are applied when it becomes active.
@@ -550,7 +551,7 @@ export component AppWindow inherits Window {
     init => { Palette.color-scheme = root.dark-mode ? ColorScheme.dark : ColorScheme.light; }
     changed dark-mode => {
         Palette.color-scheme = root.dark-mode ? ColorScheme.dark : ColorScheme.light;
-        if root.editor-open { root.editor-highlight-pending = true; }
+        root.refresh-editor-syntax();
     }
     in-out property <string> term-font-family <=> Theme.term-font-family;
     in-out property <length> term-font-size <=> Theme.term-font-size;
@@ -673,6 +674,25 @@ export component AppWindow inherits Window {
     // two-way binding) must re-run the dock geometry — one hook covers them all
     // (#dock-stack).
     changed zen-mode => { root.dock-layout-changed(); }
+    // Terminal fullscreen (#495): Alt+Enter puts the window into borderless
+    // OS fullscreen and drops every piece of chrome (title bar, tab strips,
+    // toolbar, docked panels, status strip) so the terminal gets the whole
+    // screen — like Xshell's full-screen view. Transient per window, never
+    // persisted. Rust owns the toggle: it only enters while a terminal tab is
+    // active and keeps this flag in sync with the native window state.
+    in-out property <bool> term-fullscreen: false;
+    callback toggle-term-fullscreen();
+    // Leave fullscreen if the active tab is no longer a terminal (Rust check).
+    callback term-fullscreen-check();
+    // Everything zen hides is hidden in terminal fullscreen too.
+    property <bool> hide-panels: root.zen-mode || root.term-fullscreen;
+    changed term-fullscreen => {
+        if (root.term-fullscreen) {
+            root.settings-open = false;
+            root.download-open = false;
+        }
+        root.dock-layout-changed();
+    }
     // Collapse-by-default settings + shared SFTP collapse state (#78).
     in-out property <bool> collapse-sidebar-default: false;
     callback set-collapse-sidebar-default(bool);   // apply + persist
@@ -816,53 +836,27 @@ export component AppWindow inherits Window {
     callback update-action();
     callback open-update-url();
 
-    // --- Built-in file viewer/editor (#70) --------------------------------
-    in-out property <bool> editor-open: false;
-    in-out property <string> editor-name;     // file name shown in the title
-    in-out property <string> editor-path;     // remote path (used on save)
-    in-out property <string> editor-content;  // text, two-way with the input
-    in-out property <bool> editor-readonly;   // view = true, edit = false
-    in-out property <bool> editor-dirty: false; // edited since load
-    // Opening the dynamic editor and focusing its TextInput in the same event
-    // can re-enter Windows AccessKit while it is registering the new item tree.
-    property <bool> editor-focus-pending: false;
-    in-out property <string> editor-syntax-source;
-    in-out property <string> editor-syntax-spans;
-    in-out property <string> editor-language;
-    property <bool> editor-highlight-pending: false;
-    Timer {
-        interval: 100ms;
-        running: root.editor-open && root.editor-highlight-pending;
-        triggered => {
-            root.editor-highlight-pending = false;
-            root.editor-highlight(root.editor-content);
-        }
-    }
-    callback editor-highlight(string);
-    in-out property <string> editor-find-query;
-    in-out property <string> editor-replace-text;
-    in-out property <int> editor-match-count: 0;
-    in-out property <int> editor-find-position: -1;
-    callback save-file();                     // Ctrl+S / Save button (edit only)
-    callback close-editor();                  // X / Esc; discard unsaved edits (#287)
+    // --- Editor tabs (#70, #494) ------------------------------------------
+    // Settings → SFTP: open text files as tabs in this window (true) or in the
+    // detached EditorWindow (false). Each open file is a row here and a tab of
+    // kind "editor" in the panes; the tab shows only the editor (no SFTP panel
+    // or command bar) and can be dragged to split like any other tab.
+    in-out property <bool> editor-embedded: false;
+    callback set-editor-embedded(bool);       // apply + persist
+    in property <[EditorDoc]> editor-docs;
+    callback open-editor-tab(string /* owner tab */, string /* path */, string /* name */,
+                             string /* content */, bool /* readonly */);
+    callback editor-doc-edited(string /* id */, string /* content */);
+    callback editor-doc-highlight(string /* id */, string /* content */);
+    callback editor-doc-save(string /* id */);
+    callback editor-doc-replace-all(string /* id */, string /* query */, string /* replacement */);
+    callback refresh-editor-syntax();         // theme changed: recolour every doc
+    // Closing a tab with unsaved edits asks first (#287).
+    in-out property <bool> editor-discard-confirm-open: false;
+    in-out property <string> editor-discard-id;
+    callback editor-discard-confirmed(string /* id */);
     callback editor-count-matches(string /* content */, string /* query */) -> int;
     callback editor-find-step(string /* content */, string /* query */, int /* current */, bool /* reverse */) -> EditorFindResult;
-    callback editor-replace-all(string /* query */, string /* replacement */);
-    // Editor card geometry: draggable by its title bar, resizable from the
-    // bottom-right grip (same absolute-position pattern as the Interface
-    // dialog). Defaults centre the card; user drags/resizes override them.
-    property <length> ed-w: 760px;
-    property <length> ed-h: 560px;
-    property <length> ed-x: (root.width - root.ed-w) / 2;
-    property <length> ed-y: (root.height - root.ed-h) / 2;
-    property <bool> ed-dragging;
-    property <bool> ed-resizing;
-    property <length> ed-base-x;
-    property <length> ed-base-y;
-    property <length> ed-base-w;
-    property <length> ed-base-h;
-    property <length> ed-grab-x;
-    property <length> ed-grab-y;
 
     // --- Session list ------------------------------------------------------
     in property <[SessionInfo]> sessions;
@@ -1133,6 +1127,10 @@ export component AppWindow inherits Window {
         if (root.active-tab-id == "welcome" && root.terminals.length == 0) {
             shortcut-scope.focus();
         }
+        // Terminal fullscreen only makes sense on a terminal tab (#495).
+        if (root.term-fullscreen) {
+            root.term-fullscreen-check();
+        }
     }
 
     // Raw keystroke forwarding: Rust converts key+modifiers to PTY bytes.
@@ -1309,6 +1307,12 @@ export component AppWindow inherits Window {
                     && (e.text == "z" || e.text == "Z" || e.text == "\u{001a}")) {
                 root.toggle-zen-key();
                 accept
+            // Terminal fullscreen: Alt+Enter toggles (#495). Same key as the
+            // terminal branch; this catches it when focus sits elsewhere.
+            } else if (e.modifiers.alt && !e.modifiers.control && !e.modifiers.shift
+                    && (e.text == Key.Return || e.text == "\u{000d}")) {
+                root.toggle-term-fullscreen();
+                accept
             } else {
                 reject
             }
@@ -1332,7 +1336,7 @@ export component AppWindow inherits Window {
             // (move window / double-click to maximize), then the toolbar icons and
             // window controls on the right. macOS keeps its native title bar and
             // shows the toolbar icons via the overlay further below.
-            if root.custom-titlebar : Rectangle {
+            if root.custom-titlebar && !root.term-fullscreen : Rectangle {
                 height: 38px;
                 background: Theme.bg-panel;
                 tb-drag := TouchArea {
@@ -1393,11 +1397,11 @@ export component AppWindow inherits Window {
             // Collapsed-only (M5): the icon strip shows only while collapsed; the
             // panel itself (welcome-w) only while expanded — one or the other.
             property <bool> sidebar-strip-outside:
-                !root.zen-mode && root.welcome-as-sidebar && !root.welcome-collapsed
+                !root.hide-panels && root.welcome-as-sidebar && !root.welcome-collapsed
                 && root.sidebar-collapsed && root.sidebar-dock == root.welcome-sidebar-dock;
             property <length> sidebar-outside-strip: dock-area.sidebar-strip-outside ? 36px : 0px;
-            property <length> welcome-strip: (!root.zen-mode && root.welcome-as-sidebar && root.welcome-collapsed) ? 36px : 0px;
-            property <length> welcome-size: (!root.zen-mode && root.welcome-as-sidebar && !root.welcome-collapsed) ? root.welcome-sidebar-width : 0px;
+            property <length> welcome-strip: (!root.hide-panels && root.welcome-as-sidebar && root.welcome-collapsed) ? 36px : 0px;
+            property <length> welcome-size: (!root.hide-panels && root.welcome-as-sidebar && !root.welcome-collapsed) ? root.welcome-sidebar-width : 0px;
             property <length> welcome-taken: welcome-strip + welcome-size + sidebar-outside-strip;
             property <bool> welcome-horizontal: root.welcome-sidebar-horizontal;
             property <bool> welcome-sidebar-dragging;
@@ -1416,7 +1420,7 @@ export component AppWindow inherits Window {
                 && !dock-area.quick-merge-welcome && root.sidebar-collapsed
                 && root.quick-panel-dock == root.sidebar-dock;
             property <length> quick-outer-strip:
-                !root.zen-mode && root.quick-panel-open && root.quick-panel-collapsed
+                !root.hide-panels && root.quick-panel-open && root.quick-panel-collapsed
                     && !dock-area.quick-merge-welcome && !dock-area.quick-merge-sidebar
                     ? 36px : 0px;
             property <bool> quick-outer-horizontal:
@@ -1487,7 +1491,7 @@ export component AppWindow inherits Window {
             // Collapsed resource panel → a ToolStrip icon bar at the same docked
             // edge (M5), anchored to the OUTER edge of dock-area so it lines up
             // with the 36px band the Rust dock engine reserves for it (#dock-stack).
-            if !root.zen-mode && root.sidebar-collapsed && !dock-area.combine-collapsed-tools && !dock-area.sidebar-strip-outside : ToolStrip {
+            if !root.hide-panels && root.sidebar-collapsed && !dock-area.combine-collapsed-tools && !dock-area.sidebar-strip-outside : ToolStrip {
                 x: root.sidebar-dock == "right"
                     ? parent.width - 36px - parent.quick-right
                     : parent.quick-left;
@@ -1689,9 +1693,9 @@ export component AppWindow inherits Window {
             // A shared ToolStrip is already reserved outside `rest` while the
             // welcome panel is expanded, or by the merged welcome strip while both
             // panels are collapsed. Do not reserve the same 36px a second time.
-            property <length> sb-w: root.zen-mode ? 0px
+            property <length> sb-w: root.hide-panels ? 0px
                 : root.sidebar-collapsed ? 36px : 0px;
-            property <length> sb-h: root.zen-mode ? 0px
+            property <length> sb-h: root.hide-panels ? 0px
                 : root.sidebar-collapsed ? 36px : 0px;
             property <length> sp: 0px;
             // The collapsed bar (sb-h) already reserves the bottom strip now.
@@ -1866,7 +1870,9 @@ export component AppWindow inherits Window {
                     VerticalLayout {
                     spacing: 0;
 
-                    HorizontalLayout {
+                    // Terminal fullscreen hides every tab strip (#495); Ctrl+Tab
+                    // still cycles tabs.
+                    if !root.term-fullscreen : HorizontalLayout {
                     spacing: 0;
                     // (Collapsed resource panel now reserves its own ToolStrip slot in
                     // `rest`, so the tab strip no longer needs a spacer for it.)
@@ -1997,7 +2003,8 @@ export component AppWindow inherits Window {
                     for term[i] in root.terminals : TerminalView {
                         visible: term.id == pane.active-id;
                         active: term.id == root.active-tab-id;
-                        zen-mode: root.zen-mode;
+                        // Fullscreen also hides the status strip (#495).
+                        zen-mode: root.hide-panels;
                         width: term.id == pane.active-id ? parent.width : 0px;
                         height: term.id == pane.active-id ? parent.height : 0px;
                         tab-id: term.id;
@@ -2099,6 +2106,7 @@ export component AppWindow inherits Window {
                         new-window-key() => { root.new-window-clicked(); }
                         zoom-key(direction, window-wide) => { root.zoom-term-font(term.id, direction, window-wide); }
                         zen-key() => { root.toggle-zen-key(); }
+                        fullscreen-key() => { root.toggle-term-fullscreen(); }
                         term-font-size-px: term.font-size > 0 ? term.font-size * 1.0 : root.term-font-size / 1px;
                         terminal-resize(w, h) => { root.terminal-resize(term.id, w, h) }
                         sftp-navigate(path) => { root.sftp-navigate(term.id, path); }
@@ -2177,6 +2185,41 @@ export component AppWindow inherits Window {
                         select-end() => { root.term-select-end(term.id); }
                         select-word(r, c) => { root.term-select-word(term.id, r, c); }
                         select-autoscroll(dir) => { root.term-select-autoscroll(term.id, dir); }
+                    }
+
+                    // Editor tabs (#494): same show-by-active-id scheme as the
+                    // terminals above. Only the editor is shown — no SFTP panel
+                    // or command bar; drag the tab to split it beside a terminal.
+                    for doc in root.editor-docs : EditorPane {
+                        visible: doc.id == pane.active-id;
+                        width: doc.id == pane.active-id ? parent.width : 0px;
+                        height: doc.id == pane.active-id ? parent.height : 0px;
+                        doc-mode: true;
+                        shown: doc.id == pane.active-id;
+                        active: self.shown;
+                        show-header: true;
+                        show-close: false;
+                        esc-closes: false;
+                        doc-content: doc.content;
+                        doc-revision: doc.revision;
+                        can-save: !doc.orphaned;
+                        status-note: doc.orphaned ? @tr("Connection closed") : "";
+                        editor-name: doc.name;
+                        editor-readonly: doc.readonly;
+                        editor-dirty: doc.dirty;
+                        editor-language: doc.language;
+                        editor-syntax-source: doc.syntax-source;
+                        editor-syntax-spans: doc.syntax-spans;
+                        content-changed => { root.editor-doc-edited(doc.id, self.editor-content); }
+                        save-file => { root.editor-doc-save(doc.id); }
+                        editor-highlight(text) => { root.editor-doc-highlight(doc.id, text); }
+                        editor-count-matches(content, query) => { return root.editor-count-matches(content, query); }
+                        editor-find-step(content, query, current, reverse) => {
+                            return root.editor-find-step(content, query, current, reverse);
+                        }
+                        editor-replace-all(query, replacement) => {
+                            root.editor-doc-replace-all(doc.id, query, replacement);
+                        }
                     }
 
                     // Windows may show the terminal model being reconstructed when
@@ -2621,6 +2664,7 @@ export component AppWindow inherits Window {
     // at the very top on macOS where the native title bar is separate (#119).
     IconBtn {
         x: root.width - 34px - root.toolbar-x-off; y: root.toolbar-y;
+        visible: !root.term-fullscreen;
         icon: "\u{E8B8}";
         tooltip: root.lang-en ? "Settings" : "设置";
         active: root.settings-open;
@@ -2628,6 +2672,7 @@ export component AppWindow inherits Window {
     }
     IconBtn {
         x: root.width - 64px - root.toolbar-x-off; y: root.toolbar-y;
+        visible: !root.term-fullscreen;
         icon: "\u{E8D5}";   // Material "swap_vert" — symmetrical up+down arrows, clearer "transfer" semantic
         tooltip: @tr("Transfers manager");
         active: root.download-open;
@@ -2643,6 +2688,7 @@ export component AppWindow inherits Window {
     // icon stays clean and no stray dot shows over the toolbar (#breathing-light).
     IconBtn {
         x: root.width - 94px - root.toolbar-x-off; y: root.toolbar-y;
+        visible: !root.term-fullscreen;
         icon: Theme.dark ? "\u{E518}" : "\u{E51C}";
         icon-color: Theme.dark ? #f5c542 : #5856d6;
         tooltip: root.lang-en ? "Toggle theme" : "切换主题";
@@ -2650,6 +2696,7 @@ export component AppWindow inherits Window {
     }
     IconBtn {
         x: root.width - 124px - root.toolbar-x-off; y: root.toolbar-y;
+        visible: !root.term-fullscreen;
         icon: "\u{E627}";
         icon-color: root.sync-input ? Theme.accent : Theme.text-secondary;
         active: root.sync-input;
@@ -2660,6 +2707,7 @@ export component AppWindow inherits Window {
     }
     IconBtn {
         x: root.width - 154px - root.toolbar-x-off; y: root.toolbar-y;
+        visible: !root.term-fullscreen;
         icon: "\u{E86F}";   // Material "code" — command bar
         active: !root.cmd-bar-hidden;
         tooltip: root.lang-en
@@ -2669,6 +2717,7 @@ export component AppWindow inherits Window {
     }
     IconBtn {
         x: root.width - 184px - root.toolbar-x-off; y: root.toolbar-y;
+        visible: !root.term-fullscreen;
         icon: "\u{F10D}";   // Material "push_pin" — always on top (#450)
         icon-color: root.pinned ? Theme.accent : Theme.text-secondary;
         active: root.pinned;
@@ -2680,7 +2729,7 @@ export component AppWindow inherits Window {
 
     // Frameless resize edges (#119): thin hit-zones that start an OS-level
     // resize via winit. Hidden when maximized.
-    if root.custom-titlebar && !root.window-maximized : Rectangle {
+    if root.custom-titlebar && !root.window-maximized && !root.term-fullscreen : Rectangle {
         width: 100%;
         height: 100%;
         TouchArea {  // top
@@ -2781,360 +2830,21 @@ export component AppWindow inherits Window {
         }
     }
 
-    // --- Built-in file viewer / editor (#70) ------------------------------
-    // View = read-only (selectable/copyable); Edit = writable, Ctrl+S or the
-    // Save button uploads, and closing uploads any unsaved changes.
-    // EditorWindow is the active top-level editor. Keep this legacy block
-    // disabled while retaining the old properties for source compatibility.
-    if false && root.editor-open : Rectangle {
-        // Modal backdrop; clicking it does NOT close (avoids losing edits to a
-        // stray click) — use the close button or Esc. Also swallow wheel events
-        // so scrolling can't leak through to the terminal underneath (#70).
-        background: #00000088;
-        TouchArea {
-            scroll-event(event) => { accept }
+    // --- Editor tabs: discard confirmation (#287, #494) --------------------
+    // Closing an editor tab with unsaved edits asks first, like the detached
+    // editor window. Rust opens this from the tab-close path.
+    ConfirmDialog {
+        is-open <=> root.editor-discard-confirm-open;
+        is-mac: root.is-mac;
+        dismiss-on-backdrop: false;
+        title: @tr("Discard unsaved changes?");
+        message: @tr("This file has unsaved changes. Close without saving?");
+        confirm-label: @tr("Discard and close");
+        confirm => {
+            root.editor-discard-confirm-open = false;
+            root.editor-discard-confirmed(root.editor-discard-id);
         }
-        edit-fs := FocusScope {
-            // Ctrl+S saves, Esc closes. These bubble up from the focused
-            // TextInput because it doesn't consume them.
-            key-pressed(e) => {
-                // ⌘S on macOS, Ctrl+S elsewhere. (Slint maps `control` to Cmd on
-                // macOS — see #158, so no platform branch is needed here.) On macOS
-                // Cmd+letter arrives as the C0 control char (Cmd+S = "\u{13}"), not
-                // "s" — confirmed on an M4 — so accept both forms (#158).
-                if (e.modifiers.control && (e.text == "s" || e.text == "S" || e.text == "\u{0013}")) {
-                    root.save-file();
-                    return accept;
-                }
-                if (e.text == Key.Escape) {
-                    root.close-editor();
-                    return accept;
-                }
-                return reject;
-            }
-            Rectangle {
-                x: root.ed-x;
-                y: root.ed-y;
-                width: root.ed-w;
-                height: root.ed-h;
-                background: Theme.popup-bg;
-                border-radius: Theme.radius-md;
-                border-width: 1px;
-                border-color: Theme.border-strong;
-                drop-shadow-blur: 24px;
-                drop-shadow-color: #00000080;
-                clip: true;
-
-                VerticalLayout {
-                    // Title bar — drag to move; the buttons stay on top.
-                    Rectangle {
-                        height: 40px;
-                        background: Theme.popup-bg-alt;
-                        ed-title-drag := TouchArea {
-                            mouse-cursor: move;
-                            pointer-event(e) => {
-                                if (e.kind == PointerEventKind.down) {
-                                    root.ed-dragging = true;
-                                    root.ed-base-x = root.ed-x;
-                                    root.ed-base-y = root.ed-y;
-                                    root.ed-grab-x = self.absolute-position.x + self.mouse-x;
-                                    root.ed-grab-y = self.absolute-position.y + self.mouse-y;
-                                } else if (e.kind == PointerEventKind.up) {
-                                    root.ed-dragging = false;
-                                }
-                            }
-                            moved => {
-                                if (root.ed-dragging) {
-                                    root.ed-x = root.ed-base-x + (self.absolute-position.x + self.mouse-x - root.ed-grab-x);
-                                    root.ed-y = root.ed-base-y + (self.absolute-position.y + self.mouse-y - root.ed-grab-y);
-                                }
-                            }
-                        }
-                        HorizontalLayout {
-                            padding-left: 14px;
-                            padding-right: 8px;
-                            // Centre the 28px buttons inside the 40px bar so the
-                            // Save button isn't glued to the top edge (#70).
-                            padding-top: 6px;
-                            padding-bottom: 6px;
-                            spacing: 8px;
-                            Text {
-                                text: root.editor-name + "  ·  " + root.editor-language
-                                    + (root.editor-readonly
-                                        ? "  ·  " + @tr("Read-only")
-                                        : (root.editor-dirty ? "  ·  " + @tr("Modified") : ""));
-                                color: Theme.text-primary;
-                                font-size: Theme.fs-md;
-                                font-weight: 600;
-                                font-family: Theme.ui-font-family;
-                                vertical-alignment: center;
-                                horizontal-stretch: 1;
-                                overflow: elide;
-                            }
-                            if !root.editor-readonly : Rectangle {
-                                width: 76px; height: 28px;
-                                border-radius: Theme.radius-sm;
-                                background: ed-save-ta.has-hover ? Theme.accent-hover : Theme.accent;
-                                ed-save-ta := TouchArea {
-                                    mouse-cursor: pointer;
-                                    clicked => { root.save-file(); }
-                                }
-                                Text { text: @tr("Save"); color: #ffffff; font-size: Theme.fs-sm;
-                                       horizontal-alignment: center; vertical-alignment: center; }
-                            }
-                            Rectangle {
-                                width: 28px; height: 28px;
-                                border-radius: Theme.radius-sm;
-                                background: ed-close-ta.has-hover ? Theme.bg-hover : transparent;
-                                ed-close-ta := TouchArea {
-                                    mouse-cursor: pointer;
-                                    clicked => { root.close-editor(); }
-                                }
-                                Text { text: "\u{E5CD}"; font-family: "Material Icons";
-                                       color: Theme.text-secondary; font-size: Theme.fs-md;
-                                       horizontal-alignment: center; vertical-alignment: center; }
-                            }
-                        }
-                    }
-                    Rectangle { height: 1px; background: Theme.border-subtle; }
-
-                    // Lightweight find/replace bar (#287). Replacement is
-                    // explicit; closing the editor never writes the file.
-                    Rectangle {
-                        height: 38px;
-                        background: Theme.popup-bg;
-                        HorizontalLayout {
-                            padding-left: 8px; padding-right: 8px;
-                            padding-top: 5px; padding-bottom: 5px; spacing: 6px;
-                            Text { text: @tr("Find"); color: Theme.text-muted; vertical-alignment: center; }
-                            TextInput {
-                                horizontal-stretch: 1;
-                                single-line: true;
-                                vertical-alignment: center;
-                                font-family: Theme.ui-font-family;
-                                font-size: Theme.fs-md;
-                                color: Theme.text-primary;
-                                text <=> root.editor-find-query;
-                                edited => {
-                                    root.editor-find-position = -1;
-                                    root.editor-match-count = root.editor-count-matches(
-                                        root.editor-content, root.editor-find-query);
-                                }
-                            }
-                            Text {
-                                width: 42px;
-                                text: root.editor-find-query == "" ? "" : root.editor-match-count;
-                                color: Theme.text-muted;
-                                vertical-alignment: center;
-                                horizontal-alignment: center;
-                            }
-                            Rectangle {
-                                width: 28px;
-                                border-radius: Theme.radius-sm;
-                                background: find-prev-ta.has-hover ? Theme.bg-hover : Theme.bg-elevated;
-                                find-prev-ta := TouchArea {
-                                    enabled: root.editor-match-count > 0;
-                                    clicked => {
-                                        let found = root.editor-find-step(root.editor-content,
-                                            root.editor-find-query, root.editor-find-position, true);
-                                        root.editor-find-position = found.start;
-                                        root.editor-match-count = found.count;
-                                        edit-input.set-selection-offsets(found.start, found.end);
-                                        edit-input.focus();
-                                    }
-                                }
-                                Text { text: "↑"; color: Theme.text-primary; horizontal-alignment: center; vertical-alignment: center; }
-                            }
-                            Rectangle {
-                                width: 28px;
-                                border-radius: Theme.radius-sm;
-                                background: find-next-ta.has-hover ? Theme.bg-hover : Theme.bg-elevated;
-                                find-next-ta := TouchArea {
-                                    enabled: root.editor-match-count > 0;
-                                    clicked => {
-                                        let found = root.editor-find-step(root.editor-content,
-                                            root.editor-find-query, root.editor-find-position, false);
-                                        root.editor-find-position = found.start;
-                                        root.editor-match-count = found.count;
-                                        edit-input.set-selection-offsets(found.start, found.end);
-                                        edit-input.focus();
-                                    }
-                                }
-                                Text { text: "↓"; color: Theme.text-primary; horizontal-alignment: center; vertical-alignment: center; }
-                            }
-                            Text { text: @tr("Replace"); color: Theme.text-muted; vertical-alignment: center; }
-                            TextInput {
-                                horizontal-stretch: 1;
-                                single-line: true;
-                                vertical-alignment: center;
-                                font-family: Theme.ui-font-family;
-                                font-size: Theme.fs-md;
-                                color: Theme.text-primary;
-                                text <=> root.editor-replace-text;
-                            }
-                            Rectangle {
-                                width: 88px;
-                                border-radius: Theme.radius-sm;
-                                background: replace-all-ta.has-hover ? Theme.bg-hover : Theme.bg-elevated;
-                                replace-all-ta := TouchArea {
-                                    enabled: !root.editor-readonly && root.editor-find-query != "";
-                                    clicked => {
-                                        root.editor-replace-all(root.editor-find-query, root.editor-replace-text);
-                                    }
-                                }
-                                Text {
-                                    text: @tr("Replace all");
-                                    color: replace-all-ta.enabled ? Theme.text-primary : Theme.text-muted;
-                                    font-size: Theme.fs-sm;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                }
-                            }
-                        }
-                    }
-                    Rectangle { height: 1px; background: Theme.border-subtle; }
-
-                    // Text area: a line-number gutter on the left + the editor.
-                    // Wrap long lines to the visible editor width so text and
-                    // selection painting cannot overflow to the right (#387).
-                    // The gutter stays pinned and follows vertical scrolling.
-                    Rectangle {
-                        vertical-stretch: 1;
-                        background: Theme.bg-root;
-                        HorizontalLayout {
-                            spacing: 0;
-                            Rectangle {
-                                width: 48px;
-                                background: Theme.bg-panel-alt;
-                                clip: true;
-                                TextInput {
-                                    x: 0px;
-                                    y: ed-scroll.viewport-y + 8px;
-                                    width: edit-input.width;
-                                    height: edit-input.height;
-                                    text: root.editor-content;
-                                    syntax-source: root.editor-content;
-                                    line-number-width: parent.width - 6px;
-                                    read-only: true;
-                                    enabled: false;
-                                    single-line: false;
-                                    wrap: edit-input.wrap;
-                                    font-family: edit-input.font-family;
-                                    font-size: edit-input.font-size;
-                                    color: Theme.text-muted;
-                                }
-                            }
-                            Rectangle { width: 1px; background: Theme.border-subtle; }
-                            editor-viewport := Rectangle {
-                                horizontal-stretch: 1;
-                                clip: true;
-                                // TextInput owns the pointer grab while selecting
-                                // and ignores wheel events. Catch the rejected
-                                // wheel behind it and scroll the editor (#388).
-                                editor-wheel := TouchArea {
-                                    scroll-event(event) => {
-                                        ed-scroll.viewport-y = clamp(
-                                            ed-scroll.viewport-y + event.delta-y,
-                                            min(0px, ed-scroll.visible-height - ed-scroll.viewport-height),
-                                            0px);
-                                        accept
-                                    }
-                                }
-                                ed-scroll := ScrollView {
-                                    viewport-width: self.visible-width;
-                                    viewport-height: max(self.visible-height, edit-input.preferred-height + 16px);
-                                    edit-input := TextInput {
-                                        x: 8px;
-                                        y: 8px;
-                                        width: max(1px, ed-scroll.visible-width - 16px);
-                                        height: max(ed-scroll.visible-height - 16px, self.preferred-height);
-                                        text <=> root.editor-content;
-                                        syntax-source: root.editor-syntax-source;
-                                        syntax-spans: root.editor-syntax-spans;
-                                        read-only: root.editor-readonly;
-                                        single-line: false;
-                                        wrap: char-wrap;
-                                        color: Theme.text-primary;
-                                        font-family: Theme.ui-font-family;
-                                        font-size: Theme.fs-md;
-                                        page-height: ed-scroll.visible-height;
-                                        cursor-position-changed(position) => {
-                                            // Keep a keyboard/drag selection endpoint
-                                            // visible. During a pointer grab this also
-                                            // advances the viewport as the mouse moves
-                                            // beyond its top or bottom edge (#388).
-                                            let cursor-y = position.y + self.y + ed-scroll.viewport-y;
-                                            if (cursor-y < 12px) {
-                                                ed-scroll.viewport-y = min(0px,
-                                                    ed-scroll.viewport-y + 12px - cursor-y);
-                                            } else if (cursor-y > ed-scroll.visible-height - 12px) {
-                                                ed-scroll.viewport-y = max(
-                                                    min(0px, ed-scroll.visible-height - ed-scroll.viewport-height),
-                                                    ed-scroll.viewport-y
-                                                        - (cursor-y - ed-scroll.visible-height + 12px));
-                                            }
-                                        }
-                                        edited => {
-                                            root.editor-dirty = true;
-                                            root.editor-highlight-pending = true;
-                                            root.editor-match-count = root.editor-count-matches(
-                                                root.editor-content, root.editor-find-query);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Bottom-right resize grip (#70).
-                Rectangle {
-                    x: parent.width - 18px;
-                    y: parent.height - 18px;
-                    width: 18px;
-                    height: 18px;
-                    ed-resize-ta := TouchArea {
-                        mouse-cursor: nwse-resize;
-                        pointer-event(e) => {
-                            if (e.kind == PointerEventKind.down) {
-                                root.ed-resizing = true;
-                                root.ed-base-w = root.ed-w;
-                                root.ed-base-h = root.ed-h;
-                                root.ed-grab-x = self.absolute-position.x + self.mouse-x;
-                                root.ed-grab-y = self.absolute-position.y + self.mouse-y;
-                            } else if (e.kind == PointerEventKind.up) {
-                                root.ed-resizing = false;
-                            }
-                        }
-                        moved => {
-                            if (root.ed-resizing) {
-                                root.ed-w = max(420px, root.ed-base-w + (self.absolute-position.x + self.mouse-x - root.ed-grab-x));
-                                root.ed-h = max(280px, root.ed-base-h + (self.absolute-position.y + self.mouse-y - root.ed-grab-y));
-                            }
-                        }
-                    }
-                    Text {
-                        text: "◢";
-                        color: ed-resize-ta.has-hover ? Theme.text-secondary : Theme.text-muted;
-                        font-size: 10px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-                }
-            }
-            // Defer focus until the next UI turn. Focusing directly from init
-            // re-enters Slint's Windows accessibility adapter and can panic
-            // with "RefCell already borrowed" (#386).
-            init => { root.editor-focus-pending = true; }
-            editor-focus-timer := Timer {
-                interval: 0ms;
-                running: root.editor-focus-pending;
-                triggered => {
-                    root.editor-focus-pending = false;
-                    edit-input.focus();
-                }
-            }
-        }
+        cancel => { root.editor-discard-confirm-open = false; }
     }
 
     // --- Download manager popup -------------------------------------------
@@ -3274,8 +2984,8 @@ export component AppWindow inherits Window {
 
                 Flickable {
                     vertical-stretch: 1;
-                    viewport-width: self.width;
-                    viewport-height: max(self.height, xfer-col.preferred-height);
+                    content-width: self.width;
+                    content-height: max(self.height, xfer-col.preferred-height);
                     xfer-col := VerticalLayout {
                         alignment: start;
                         spacing: 4px;
@@ -3881,8 +3591,8 @@ export component AppWindow inherits Window {
                         background: Theme.bg-root;
                         clip: true;
                         Flickable {
-                            viewport-width: self.width;
-                            viewport-height: max(self.height, qcm-cmd-in.preferred-height + 12px);
+                            content-width: self.width;
+                            content-height: max(self.height, qcm-cmd-in.preferred-height + 12px);
                             qcm-cmd-in := TextInput {
                                 x: 8px; y: 6px;
                                 width: parent.width - 16px;
@@ -3945,8 +3655,8 @@ export component AppWindow inherits Window {
                 // Existing commands list with delete buttons.
                 Flickable {
                     vertical-stretch: 1;
-                    viewport-width: self.width;
-                    viewport-height: max(self.height, qcm-list.preferred-height);
+                    content-width: self.width;
+                    content-height: max(self.height, qcm-list.preferred-height);
                     qcm-list := VerticalLayout {
                         alignment: start;
                         spacing: 2px;
@@ -4583,6 +4293,7 @@ export component AppWindow inherits Window {
                        color: Theme.text-muted; font-size: Theme.fs-xs; }
                 ShortcutRow { keys: root.is-mac ? "⌘⇧N" : "Ctrl+Shift+N"; desc: root.lang-en ? "New window" : "新建窗口"; }
                 ShortcutRow { keys: root.is-mac ? "⌘⌥Z" : "Ctrl+Alt+Z"; desc: root.lang-en ? "Toggle zen (focus) mode" : "切换专注模式"; }
+                ShortcutRow { keys: root.is-mac ? "⌥↩" : "Alt+Enter"; desc: root.lang-en ? "Toggle terminal fullscreen" : "切换终端全屏"; }
 
                 Rectangle { height: 6px; }
                 Text { text: root.lang-en ? "Terminal" : "终端";
@@ -4937,7 +4648,7 @@ export component AppWindow inherits Window {
                     background: Theme.bg-root;
                     clip: true;
                     Flickable {
-                        viewport-height: max(self.height, bi-input.preferred-height + 16px);
+                        content-height: max(self.height, bi-input.preferred-height + 16px);
                         bi-input := TextInput {
                             x: 10px;
                             y: 8px;
@@ -5250,6 +4961,7 @@ export component AppWindow inherits Window {
                     output-highlight-rule-status <=> root.output-highlight-rule-status;
                     ui-scale: root.ui-scale;
                     sftp-follow-cd <=> root.sftp-follow-cd;
+                    editor-embedded <=> root.editor-embedded;
                     collapse-sidebar-default <=> root.collapse-sidebar-default;
                     collapse-sftp-default <=> root.collapse-sftp-default;
                     sync-upload-enabled <=> root.sync-upload-enabled;
@@ -5319,6 +5031,7 @@ export component AppWindow inherits Window {
                     set-panel-font(v) => { root.set-panel-font(v); }
                     set-renderer-mode(v) => { root.set-renderer-mode(v); }
                     set-sftp-follow-cd(v) => { root.set-sftp-follow-cd(v); }
+                    set-editor-embedded(v) => { root.set-editor-embedded(v); }
                     set-collapse-sidebar-default(v) => { root.set-collapse-sidebar-default(v); }
                     set-collapse-sftp-default(v) => { root.set-collapse-sftp-default(v); }
                     set-sync-upload-enabled(v) => { root.set-sync-upload-enabled(v); }
@@ -5416,7 +5129,7 @@ export component AppWindow inherits Window {
     // same visual affordance + drag-resize behavior when the OS title bar is
     // hidden (custom-titlebar mode). Only rendered in frameless mode; otherwise
     // the OS frame already provides this corner.
-    if root.custom-titlebar : Rectangle {
+    if root.custom-titlebar && !root.term-fullscreen : Rectangle {
         width: 16px;
         height: 16px;
         x: root.width - self.width;

@@ -10,6 +10,8 @@ mod auth_dialogs;
 mod aux_windows;
 pub(crate) mod core;
 mod dock_stacks;
+mod editor_host;
+mod editor_tabs;
 mod file_drop;
 mod fonts;
 mod helpers;
@@ -51,6 +53,8 @@ mod window_events;
 use self::auth_dialogs::*;
 use self::aux_windows::*;
 use self::dock_stacks::*;
+use self::editor_host::*;
+use self::editor_tabs::*;
 use self::file_drop::*;
 use self::fonts::*;
 use self::helpers::*;
@@ -332,6 +336,7 @@ pub fn run(_intent: crate::app::launch::LaunchIntent) -> Result<()> {
 
     #[cfg(windows)]
     crate::update::windows::cleanup_stale_downloads();
+    crate::update::inplace::cleanup_after_update();
     open_window(core.clone(), false, None)?;
     let tray_timer = tray::install(core.clone());
 

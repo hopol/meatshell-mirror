@@ -385,6 +385,7 @@ export component InterfacePanel inherits Rectangle {
     in-out property <string> output-highlight-rule-status;
     in property <float> ui-scale;
     in-out property <bool> sftp-follow-cd;
+    in-out property <bool> editor-embedded;
     in-out property <bool> collapse-sidebar-default;
     in-out property <bool> collapse-sftp-default;
     in-out property <bool> sync-upload-enabled;
@@ -461,6 +462,7 @@ export component InterfacePanel inherits Rectangle {
     callback set-panel-font(int);   // settings-panel font scale, percent
     callback set-renderer-mode(string);
     callback set-sftp-follow-cd(bool);
+    callback set-editor-embedded(bool);
     callback set-collapse-sidebar-default(bool);
     callback set-collapse-sftp-default(bool);
     callback set-sync-upload-enabled(bool);
@@ -503,8 +505,8 @@ export component InterfacePanel inherits Rectangle {
             nav-scroll := ScrollView {
                 width: 100%;
                 height: 100%;
-                viewport-width: self.visible-width;
-                viewport-height: max(self.visible-height, nav-items.preferred-height);
+                content-width: self.visible-width;
+                content-height: max(self.visible-height, nav-items.preferred-height);
                 nav-items := VerticalLayout {
                     width: nav-scroll.visible-width;
                     padding: 10px;
@@ -599,8 +601,8 @@ export component InterfacePanel inherits Rectangle {
             settings-scroll := ScrollView {
                 width: 100%;
                 height: 100%;
-                viewport-width: self.visible-width;
-                viewport-height: max(self.visible-height, settings-pages.preferred-height);
+                content-width: self.visible-width;
+                content-height: max(self.visible-height, settings-pages.preferred-height);
 
                 settings-pages := VerticalLayout {
                     width: settings-scroll.visible-width;
@@ -1026,8 +1028,8 @@ export component InterfacePanel inherits Rectangle {
                 builtin-wallpapers-scroll := ScrollView {
                     height: 106px;
                     width: 100%;
-                    viewport-width: max(self.visible-width, builtin-wallpapers-row.preferred-width);
-                    viewport-height: self.visible-height;
+                    content-width: max(self.visible-width, builtin-wallpapers-row.preferred-width);
+                    content-height: self.visible-height;
 
                     builtin-wallpapers-row := HorizontalLayout {
                         spacing: 11px;
@@ -1338,10 +1340,20 @@ export component InterfacePanel inherits Rectangle {
                     desc: root.lang-en
                         ? "A cd in the terminal switches the SFTP panel to the same directory."
                         : "终端里执行 cd 时,SFTP 面板自动切到相同目录。";
-                    show-divider: false;
                     Switch {
                         on: root.sftp-follow-cd;
                         toggled(v) => { root.sftp-follow-cd = v; root.set-sftp-follow-cd(v); }
+                    }
+                }
+                SettingRow {
+                    label: root.lang-en ? "Open files in a tab" : "在标签页中打开文件";
+                    desc: root.lang-en
+                        ? "On: text files open as editor tabs in the main window (drag a tab to split it). Off: they open in a separate editor window."
+                        : "开启:文本文件以编辑器标签页在主界面中打开(拖动标签可分屏)。关闭:在单独的编辑器窗口中打开。";
+                    show-divider: false;
+                    Switch {
+                        on: root.editor-embedded;
+                        toggled(v) => { root.editor-embedded = v; root.set-editor-embedded(v); }
                     }
                 }
             }
