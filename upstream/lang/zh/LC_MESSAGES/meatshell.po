@@ -378,6 +378,12 @@ msgstr "终端字符集"
 msgid "Use GBK for servers configured for GB2312 or GBK output."
 msgstr "远端使用 GB2312 或 GBK 输出时请选择 GBK。"
 
+msgid "Terminal type"
+msgstr "终端类型"
+
+msgid "Sent to the server as TERM. Try xterm if a program fails to start or shows garbled output."
+msgstr "作为 TERM 发送给服务器。若程序无法启动或显示乱码，可尝试 xterm。"
+
 msgid "Enable VT100 line drawing even in UTF-8 mode"
 msgstr "启用 VT100 线框绘制（即使 UTF-8 模式）"
 
@@ -723,3 +729,18 @@ msgstr "保存会话"
 
 msgid "Create session"
 msgstr "创建会话"
+
+msgid "Bookmarks"
+msgstr "书签"
+
+msgid "None yet. Click ☆ to bookmark the current folder."
+msgstr "暂无书签，点击 ☆ 收藏当前目录。"
+
+msgid "Recent"
+msgstr "最近访问"
+
+msgid "Folders you open will show up here."
+msgstr "打开过的目录会显示在这里。"
+
+msgid "Clear recent"
+msgstr "清除最近访问"
