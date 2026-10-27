@@ -744,3 +744,15 @@ msgstr "打开过的目录会显示在这里。"
 
 msgid "Clear recent"
 msgstr "清除最近访问"
+
+msgid "Add to session list"
+msgstr "加入会话列表"
+
+msgid "Optional, typed at the login prompt"
+msgstr "可选，在登录提示时自动输入"
+
+msgid "Optional, typed at the password prompt"
+msgstr "可选，在密码提示时自动输入"
+
+msgid "MeatShell answers the device's first login and password prompts with these. Leave them blank to type them yourself."
+msgstr "MeatShell 会用这些信息自动回应设备首次出现的登录和密码提示。留空则由你手动输入。"

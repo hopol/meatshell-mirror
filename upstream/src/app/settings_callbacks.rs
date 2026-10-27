@@ -74,6 +74,8 @@ pub(super) fn apply_saved_appearance(ctx: &WinCtx) {
         });
     }
 
+    // Colour theme preset + immersive switch (Wallpaper & theme).
+    super::color_theme::apply_color_theme(window, &store.borrow());
     // Apply the saved immersive wallpaper (overrides dark/light when set; a
     // missing custom file falls back to the plain theme).
     {
@@ -798,7 +800,9 @@ pub(super) fn wire_ui_scale_and_wallpaper(ctx: &WinCtx) {
             let mut selected_builtin_theme = None;
             if let Some(w) = weak.upgrade() {
                 apply_wallpaper(&w, &store.borrow(), &bufs_wp, &id, true);
-                if crate::wallpaper::is_builtin(&id) {
+                // With immersive colours off, the wallpaper did not touch
+                // light/dark, so there is no new preference to persist.
+                if crate::wallpaper::is_builtin(&id) && store.borrow().immersive_colors() {
                     selected_builtin_theme = Some(w.get_dark_mode());
                 }
                 // Keep an already-open process window in sync with the change.

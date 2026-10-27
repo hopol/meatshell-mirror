@@ -8,6 +8,7 @@
 mod agents;
 mod auth_dialogs;
 mod aux_windows;
+mod color_theme;
 pub(crate) mod core;
 mod dock_stacks;
 mod drag_out;
@@ -29,6 +30,7 @@ mod panes;
 mod port_forward;
 mod quick_commands;
 mod resource_ui;
+mod save_tab_session;
 mod session_callbacks;
 mod session_event;
 mod session_editor;

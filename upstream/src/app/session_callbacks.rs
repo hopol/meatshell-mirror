@@ -1320,6 +1320,8 @@ pub(super) fn wire_session_callbacks(
                 title: tab_title.into(),
                 kind: "terminal".into(),
                 connected: false,
+                // Local shells offer "Add to session list" (#501).
+                local: session.kind == SessionKind::Local,
             });
             // Each session keeps its own SFTP collapse state + sizes, seeded from
             // the global defaults (the "collapse SFTP by default" pref and the
@@ -1637,6 +1639,8 @@ pub(super) fn listen_for_config_changes(ctx: &WinCtx, sessions_model: &Rc<VecMod
                 w.invoke_refresh_agent_launchers();
                 // Re-apply the theme to the chrome AND every open terminal buffer.
                 apply_dark_mode(&w, &bufs, theme_pref_is_dark(&store.borrow()));
+                // Colour theme preset + immersive switch (Wallpaper & theme).
+                super::color_theme::apply_color_theme(&w, &store.borrow());
                 // Language translations are process-global; refresh our flag only.
                 w.set_lang_en(crate::i18n::is_en());
                 // Command-bar visibility is a global preference.

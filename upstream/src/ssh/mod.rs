@@ -13,6 +13,8 @@ pub(crate) mod proxy;
 mod ssh;
 #[path = "impls/ssh_config.rs"]
 pub(crate) mod ssh_config;
+#[path = "impls/ssh_cli.rs"]
+pub(crate) mod ssh_cli;
 
 pub(crate) use ssh::*;
 pub(crate) use structs::*;

@@ -747,3 +747,15 @@ msgstr "Folders you open will show up here."
 
 msgid "Clear recent"
 msgstr "Clear recent"
+
+msgid "Add to session list"
+msgstr "Add to session list"
+
+msgid "Optional, typed at the login prompt"
+msgstr "Optional, typed at the login prompt"
+
+msgid "Optional, typed at the password prompt"
+msgstr "Optional, typed at the password prompt"
+
+msgid "MeatShell answers the device's first login and password prompts with these. Leave them blank to type them yourself."
+msgstr "MeatShell answers the device's first login and password prompts with these. Leave them blank to type them yourself."
