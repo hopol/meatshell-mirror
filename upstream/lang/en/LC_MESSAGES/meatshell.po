@@ -759,3 +759,27 @@ msgstr "Optional, typed at the password prompt"
 
 msgid "MeatShell answers the device's first login and password prompts with these. Leave them blank to type them yourself."
 msgstr "MeatShell answers the device's first login and password prompts with these. Leave them blank to type them yourself."
+
+msgid "Open"
+msgstr "Open"
+
+msgid "Split view"
+msgstr "Split view"
+
+msgid "Upload to server"
+msgstr "Upload to server"
+
+msgid "Upload checked items"
+msgstr "Upload checked items"
+
+msgid "Download to local folder"
+msgstr "Download to local folder"
+
+msgid "Download checked to local folder"
+msgstr "Download checked to local folder"
+
+msgid "Selected items"
+msgstr "Selected items"
+
+msgid "System information"
+msgstr "System information"

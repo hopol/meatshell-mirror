@@ -99,6 +99,13 @@ pub(super) fn handle_file_drop_at(
         return; // dropped outside the terminal panel — ignore
     }
 
+    // Split view: dropping onto the *local* half copies the file into the local
+    // folder that half is showing instead of uploading it to the remote one.
+    if let Some((tab, dir)) = sftp_local_pane_hit(win, client_x, client_y) {
+        copy_into(win, &tab, std::path::PathBuf::from(dir), path);
+        return;
+    }
+
     let dir = active_sftp_path(win, &active);
     if dir.is_empty() {
         return;
