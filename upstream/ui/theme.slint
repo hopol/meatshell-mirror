@@ -1,0 +1,200 @@
+// Central design tokens for meatshell.
+//
+// All colour values are reactive: change `dark` and every widget repaints
+// automatically via Slint's property-binding system.
+//
+// Dark palette  — high-contrast charcoal (original meatshell look).
+// Light palette — Apple macOS-inspired:
+//   • Backgrounds use #f5f5f7 (Apple page gray) instead of pure white to
+//     avoid eye-strain.
+//   • Primary text is #1d1d1f (Apple near-black) not #000000.
+//   • Accent is #0071e3 (Apple blue), consistent across both themes.
+
+// One colour theme variant (light or dark) of the Wallpaper & theme presets.
+// Rust fills it from the selected preset; the defaults below are the original
+// MeatShell palette.
+export struct ThemePalette {
+    bg-root: color,
+    bg-panel: color,
+    bg-panel-alt: color,
+    bg-elevated: color,
+    bg-hover: color,
+    bg-active: color,
+    tab-active-bg: color,
+    tab-active-border: color,
+    border-subtle: color,
+    border-strong: color,
+    text-primary: color,
+    text-secondary: color,
+    text-muted: color,
+    accent: color,
+    accent-hover: color,
+    accent-pressed: color,
+    term-bg: color,
+}
+
+export global Theme {
+    // Set by Rust on startup (system detection) and on user toggle.
+    in-out property <bool> dark: true;
+
+    // --- Colour theme presets (Settings › Wallpaper & theme) --------------
+    in-out property <ThemePalette> palette-dark: {
+        bg-root: #1b1d23, bg-panel: #23262d, bg-panel-alt: #2a2d35,
+        bg-elevated: #30333c, bg-hover: #373a44, bg-active: #3f4350,
+        tab-active-bg: #171a20, tab-active-border: #06070a,
+        border-subtle: #3a3d46, border-strong: #4a4e59,
+        text-primary: #e6e8ee, text-secondary: #b4b9c4, text-muted: #9196a3,
+        accent: #4a90e2, accent-hover: #5aa0f2, accent-pressed: #3a80d2,
+        term-bg: #0e0f13,
+    };
+    in-out property <ThemePalette> palette-light: {
+        bg-root: #f5f5f7, bg-panel: #ffffff, bg-panel-alt: #f2f2f7,
+        bg-elevated: #e8e8ed, bg-hover: #e0e0e6, bg-active: #d8d8de,
+        tab-active-bg: #ffffff, tab-active-border: #c7c7cc,
+        border-subtle: #e2e2e8, border-strong: #c7c7cc,
+        text-primary: #1d1d1f, text-secondary: #45454a, text-muted: #606066,
+        accent: #0071e3, accent-hover: #0077ed, accent-pressed: #006adb,
+        term-bg: #fafafa,
+    };
+    property <ThemePalette> p: root.dark ? root.palette-dark : root.palette-light;
+    // Immersive colours: with a wallpaper, take accent + surface tint from the
+    // image. Off keeps the wallpaper but uses the colour theme.
+    in-out property <bool> immersive: true;
+    out property <bool> immersive-active: root.wallpaper-active && root.immersive;
+
+    // --- Immersive wallpaper (set by Rust from the wallpaper module) -------
+    // When a wallpaper is active the window paints `wallpaper` behind everything
+    // (see app.slint), panels/terminal frost over it, accent + surfaces shift
+    // toward the image's colours, and Rust sets `dark` from the image luminance.
+    in-out property <image> wallpaper;
+    in-out property <bool>  wallpaper-active: false;
+    in-out property <color> wp-accent: #4a90e2;   // vivid accent from the image
+    in-out property <color> wp-tint:   #808080;   // average colour, tints surfaces
+    // Frosted-panel opacity over a wallpaper (0.30–1.00). User-adjustable via the
+    // Interface › Wallpaper opacity slider; bg-root / term-bg derive from it so one
+    // control scales the whole wallpaper wash. Default 0.85 (15% transparency).
+    in-out property <float> panel-alpha: 0.85;
+    property <float> tint-amt: 0.10;              // how far surfaces pull to wp-tint
+
+    // Frost a base surface: pull it slightly toward the wallpaper tint and make
+    // it translucent so the image shows through. Returns the plain base colour
+    // when no wallpaper is active (so the normal opaque theme is unchanged).
+    pure function frost(base: color, alpha: float) -> brush {
+        return root.immersive-active
+            ? base.mix(root.wp-tint, 1.0 - root.tint-amt).with-alpha(alpha)
+            : (root.wallpaper-active ? base.with-alpha(alpha) : base);
+    }
+
+    // --- Palette -----------------------------------------------------------
+    // Opaque window base — the wallpaper Image covers it when active, so panels
+    // frost over the image rather than over this.
+    out property <brush> window-base: root.p.bg-root;
+
+    property <color> base-bg-root:      root.p.bg-root;
+    property <color> base-bg-panel:     root.p.bg-panel;
+    property <color> base-bg-panel-alt: root.p.bg-panel-alt;
+    property <color> base-bg-elevated:  root.p.bg-elevated;
+    property <color> base-bg-hover:     root.p.bg-hover;
+    property <color> base-bg-active:    root.p.bg-active;
+
+    // bg-root frosts lighter (lower alpha) so the wallpaper reads clearly in
+    // empty / inset areas; panels stay mostly opaque for legible text.
+    out property <brush> bg-root:      frost(base-bg-root, max(0.0, root.panel-alpha - 0.44));
+    out property <brush> bg-panel:     frost(base-bg-panel, root.panel-alpha);
+    out property <brush> bg-panel-alt: frost(base-bg-panel-alt, root.panel-alpha);
+    out property <brush> bg-elevated:  frost(base-bg-elevated, root.panel-alpha);
+    out property <brush> bg-hover:     frost(base-bg-hover, min(1.0, root.panel-alpha + 0.04));
+    out property <brush> bg-active:    frost(base-bg-active, min(1.0, root.panel-alpha + 0.08));
+    // Settings dialog: 20% less transparent than the other panels so its dense
+    // grey labels stay legible even at a low wallpaper overlay (user request).
+    out property <brush> bg-panel-strong: frost(base-bg-panel, min(1.0, root.panel-alpha + 0.20));
+    // Menus, editors and modal cards must stay readable independently of the
+    // wallpaper transparency selected for ordinary application panels (#287).
+    out property <brush> popup-bg: base-bg-panel;
+    out property <brush> popup-bg-alt: base-bg-panel-alt;
+
+    // Active terminal tab: with wallpaper, pull from the image's average colour
+    // so the strip feels immersed; without wallpaper, make the active tab one
+    // clear step darker/lighter than the surrounding tab bar (#200).
+    out property <brush> tab-active-bg: root.immersive-active
+        ? root.wp-tint.mix(root.wp-accent, 0.68).with-alpha(min(1.0, root.panel-alpha + 0.10))
+        : (root.wallpaper-active
+            ? root.p.tab-active-bg.with-alpha(min(1.0, root.panel-alpha + 0.10))
+            : root.p.tab-active-bg);
+    out property <brush> tab-active-border: root.immersive-active
+        ? root.wp-accent.with-alpha(0.72)
+        : root.p.tab-active-border;
+
+    out property <brush> border-subtle: root.p.border-subtle;
+    out property <brush> border-strong: root.p.border-strong;
+
+    out property <brush> text-primary:   root.p.text-primary;
+    // Light-mode secondary/muted are dark enough to read over a see-through
+    // frosted-wallpaper panel.
+    out property <brush> text-secondary: root.p.text-secondary;
+    out property <brush> text-muted:     root.p.text-muted;
+
+    out property <brush> accent:         root.immersive-active ? root.wp-accent                 : root.p.accent;
+    out property <brush> accent-hover:   root.immersive-active ? root.wp-accent.brighter(0.12) : root.p.accent-hover;
+    out property <brush> accent-pressed: root.immersive-active ? root.wp-accent.darker(0.12)   : root.p.accent-pressed;
+
+    out property <brush> success: dark ? #4ec9b0 : #34c759;
+    out property <brush> warning: dark ? #e2a84a : #ff9f0a;
+    out property <brush> danger:  dark ? #e25c5c : #ff3b30;
+
+    // Terminal uses its own background so it stays readable regardless of
+    // what the shell / remote app outputs via ANSI colour codes. With a
+    // wallpaper it frosts (kept neutral, not tinted) so text stays legible.
+    property <color> base-term-bg: root.p.term-bg;
+    out property <brush> term-bg: root.wallpaper-active ? base-term-bg.with-alpha(max(0.0, root.panel-alpha - 0.14)) : base-term-bg;
+    out property <brush> term-fg: dark ? #d4d4d4 : #2d2d2f;
+
+    // True on macOS (set by Rust). App shortcuts use Cmd (⌘) here instead of
+    // Ctrl, so the physical Ctrl key stays free for the shell (^C/^X…) (#158).
+    in-out property <bool> is-mac: false;
+
+    // Whether the app window is focused & visible. Rust drives this from winit
+    // focus/minimize/occlusion events; the terminal cursor stops blinking when
+    // it's false, so an idle background window doesn't repaint (#127).
+    in-out property <bool> window-focused: true;
+
+    // Global UI scale (#100/#117/#118). Rust sets this from the saved setting;
+    // all font sizes and spacing/radii below multiply by it, so the whole UI
+    // grows/shrinks live (the terminal font has its own size setting).
+    in-out property <float> ui-scale: 1.0;
+    // Settings-panel font scale (#v0.5). The settings card + its text multiply by
+    // this so the panel (which is exempt from ui-scale) can still be enlarged.
+    in-out property <float> panel-font: 1.0;
+
+    // --- Typography --------------------------------------------------------
+    out property <length> fs-xs: 11px * root.ui-scale;
+    out property <length> fs-sm: 12px * root.ui-scale;
+    out property <length> fs-md: 13px * root.ui-scale;
+    out property <length> fs-lg: 15px * root.ui-scale;
+    out property <length> fs-xl: 18px * root.ui-scale;
+
+    // Embedded glyph-complete monospace (Cascadia Mono under a unique name, #114).
+    out property <string> font-mono: "Meatshell Mono";
+
+    // UI (sans) font for editable inputs. The embedded mono font has no CJK
+    // glyphs and native TextInput doesn't glyph-fallback like Text does, so
+    // typing Chinese into a bare TextInput renders tofu. Rust sets this to a
+    // CJK-capable system font on startup (empty = platform default).
+    in-out property <string> ui-font-family: "";
+
+    // Terminal font — user-configurable via Interface settings, set by Rust
+    // from the config on startup. cell size in terminal_view derives from these.
+    in-out property <string> term-font-family: "Meatshell Mono";
+    in-out property <length> term-font-size: 13px;
+    in-out property <bool> term-font-bold: false;
+
+    // --- Geometry ----------------------------------------------------------
+    out property <length> radius-sm: 4px * root.ui-scale;
+    out property <length> radius-md: 6px * root.ui-scale;
+    out property <length> radius-lg: 10px * root.ui-scale;
+
+    out property <length> gap-xs: 4px * root.ui-scale;
+    out property <length> gap-sm: 8px * root.ui-scale;
+    out property <length> gap-md: 12px * root.ui-scale;
+    out property <length> gap-lg: 16px * root.ui-scale;
+}
