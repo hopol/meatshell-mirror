@@ -170,6 +170,18 @@ pub(super) fn wire_interface_toggles(
     // by the download handler from the window property, so just set + persist.
     window.set_download_always_ask(store.borrow().download_always_ask());
     window.set_paste_confirm_enabled(store.borrow().paste_confirm_enabled());
+    window.set_right_click_copy(store.borrow().right_click_copy());
+    {
+        let store = store.clone();
+        let registry = registry.clone();
+        window.on_set_right_click_copy(move |enabled| {
+            let mut store = store.borrow_mut();
+            store.set_right_click_copy(enabled);
+            let _ = store.save();
+            drop(store);
+            registry.broadcast_config_changed();
+        });
+    }
     window.set_extra_paste_shortcuts_enabled(store.borrow().extra_paste_shortcuts_enabled());
     window.set_zen_mode(store.borrow().zen_mode());
     {
@@ -377,6 +389,10 @@ pub(super) fn wire_layout_prefs(ctx: &WinCtx) {
         window.set_sftp_split_enabled(s.sftp_split_enabled());
         window.set_sftp_local_split(s.sftp_local_split());
         window.set_sftp_last_local_dir(s.sftp_local_dir().into());
+        // Local list options (#532 follow-up).
+        window.set_sftp_local_show_hidden(s.sftp_local_show_hidden());
+        window.set_sftp_local_sort_key(s.sftp_local_sort_key().into());
+        window.set_sftp_local_sort_dir(s.sftp_local_sort_dir());
         let places = s.local_places();
         window.set_local_bookmarks(super::sftp_places::string_model(&places.bookmarks));
         window.set_local_recent(super::sftp_places::string_model(&places.recent));

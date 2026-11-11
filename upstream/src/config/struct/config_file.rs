@@ -184,6 +184,9 @@ pub struct ConfigFile {
     /// existing configurations unless the user explicitly disables it (#300).
     #[serde(default)]
     pub paste_confirm_disabled: bool,
+    /// Right-click copies a selection or pastes when no selection exists.
+    #[serde(default)]
+    pub right_click_copy: bool,
     /// Stored inverted so Ctrl+Alt+V, Shift+Insert, and middle-click paste stay
     /// enabled for existing users (#300).
     #[serde(default)]
@@ -273,6 +276,14 @@ pub struct ConfigFile {
     /// Machine-wide: the same folders exist for every session.
     #[serde(default, skip_serializing_if = "super::LocalPlaces::is_empty")]
     pub local_places: super::LocalPlaces,
+    /// Local pane display options (#532 follow-up): show hidden / system
+    /// entries, and which column the list is sorted by.
+    #[serde(default)]
+    pub sftp_local_show_hidden: bool,
+    #[serde(default)]
+    pub sftp_local_sort_key: String,
+    #[serde(default)]
+    pub sftp_local_sort_dir: i32,
     /// Last window size in logical px (0 = unset → use the built-in default).
     /// Lets users keep their preferred window size across restarts.
     #[serde(default)]
