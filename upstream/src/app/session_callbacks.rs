@@ -207,6 +207,7 @@ pub(super) fn wire_session_callbacks(
             // prompt ask for it, Xshell-style.
             w.set_dialog_user("".into());
             w.set_dialog_auth("password".into());
+            set_dialog_credentials(&w, &store_ng.borrow(), "");
             w.set_dialog_password("".into());
             w.set_dialog_key_path("".into());
             w.set_dialog_key_inline("".into());
@@ -464,6 +465,7 @@ pub(super) fn wire_session_callbacks(
                 w.set_dialog_port(session.port.to_string().into());
                 w.set_dialog_user(session.user.clone().into());
                 w.set_dialog_auth(session.auth.as_str().into());
+                set_dialog_credentials(&w, &store, &session.credential_id);
                 // Start blank; the dialog only loads saved credentials after
                 // opt-in, initially masked. Blank on save still retains them (#10).
                 w.set_dialog_password("".into());
@@ -860,7 +862,8 @@ pub(super) fn wire_session_callbacks(
                 };
             // Saving and testing use the same draft conversion, including blank-secret retention.
             let existing = store.borrow().get(&id).cloned();
-            let new_session = session_from_draft(&draft, existing.as_ref(), forwards, triggers);
+            let mut new_session = session_from_draft(&draft, existing.as_ref(), forwards, triggers);
+            link_draft_credential(&store.borrow(), &draft, &mut new_session);
             if new_session.kind == crate::config::SessionKind::Rdp {
                 if let Err(message) = crate::rdp::validate_options(&new_session) {
                     if let Some(w) = weak.upgrade() {
@@ -967,7 +970,8 @@ pub(super) fn wire_session_callbacks(
                         return;
                     }
                 };
-            let session = session_from_draft(&draft, existing.as_ref(), forwards, triggers);
+            let mut session = session_from_draft(&draft, existing.as_ref(), forwards, triggers);
+            link_draft_credential(&store.borrow(), &draft, &mut session);
             let weak_done = weak.clone();
 
             if kind == "ssh" {
@@ -1420,6 +1424,10 @@ pub(super) fn wire_session_callbacks(
                 selection: ModelRc::from(std::rc::Rc::new(VecModel::<TermMatch>::default())),
                 sftp_path: "/".into(),
                 sftp_entries: ModelRc::from(std::rc::Rc::new(VecModel::<SftpEntry>::default())),
+                sftp_all_entries: ModelRc::from(std::rc::Rc::new(
+                    VecModel::<SftpEntry>::default(),
+                )),
+                sftp_filter: "".into(),
                 sftp_status: if has_sftp {
                     t("SFTP 连接中...", "SFTP connecting...").into()
                 } else {
@@ -1480,6 +1488,8 @@ pub(super) fn wire_session_callbacks(
                 sftp_local_all_entries: ModelRc::from(std::rc::Rc::new(
                     VecModel::<SftpEntry>::default(),
                 )),
+                sftp_suggest: empty_suggestions(),
+                sftp_local_suggest: empty_suggestions(),
                 font_size: 0,
                 tunnels: ModelRc::from(std::rc::Rc::new(VecModel::<TunnelInfo>::default())),
                 sftp_collapsed: !has_sftp || sftp_collapsed_default,
@@ -1682,7 +1692,7 @@ pub(super) fn wire_session_callbacks(
                 let saved = store.borrow().get(&session_id).map(|s| s.name.clone());
                 saved
                     .or_else(|| {
-                        session_models::builtin_local_sessions(store.borrow().wsl_profiles())
+                        session_models::system_shell_sessions(&store.borrow())
                             .into_iter()
                             .find(|s| s.id == session_id)
                             .map(|s| s.name)
@@ -1754,7 +1764,9 @@ pub(super) fn listen_for_config_changes(ctx: &WinCtx, sessions_model: &Rc<VecMod
                 sync_sessions_for_window(&weak, &store.borrow(), &sessions_model);
                 // Custom agents (#427): launch menu and Settings list.
                 w.invoke_refresh_agent_launchers();
-                // Re-apply the theme to the chrome AND every open terminal buffer.
+                // Terminal colour schemes, then re-apply the theme to the
+                // chrome AND every open terminal buffer (re-renders them).
+                super::terminal_scheme::apply_terminal_schemes(&w, &store.borrow());
                 apply_dark_mode(&w, &bufs, theme_pref_is_dark(&store.borrow()));
                 // Colour theme preset + immersive switch (Wallpaper & theme).
                 super::color_theme::apply_color_theme(&w, &store.borrow());
@@ -1769,6 +1781,7 @@ pub(super) fn listen_for_config_changes(ctx: &WinCtx, sessions_model: &Rc<VecMod
                 super::settings_callbacks::sync_ssh_keepalive(&w, &store.borrow());
                 // Docked vs detached editor (#494) is a global preference.
                 w.set_editor_embedded(store.borrow().editor_embedded());
+                super::settings_callbacks::sync_external_editor(&w, &store.borrow());
                 if let Some(editor) = editor_weak.upgrade() {
                     sync_editor_theme(&w, &editor);
                     if editor.get_editor_open() {

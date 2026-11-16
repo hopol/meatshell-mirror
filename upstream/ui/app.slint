@@ -14,7 +14,7 @@ import "fonts/MeatshellMono-Regular.ttf";
 import "fonts/MeatshellMono-Bold.ttf";
 import "fonts/MaterialIcons-Regular.ttf";
 
-import { Theme, ThemePalette } from "theme.slint";
+import { Theme, ThemePalette, TermColors } from "theme.slint";
 import { Sidebar, DiskInfo } from "sidebar.slint";
 import { TabBar, TabInfo, LaunchItem } from "tabs.slint";
 import { Welcome, SessionInfo } from "welcome.slint";
@@ -25,17 +25,17 @@ import { LabeledInput, PrimaryButton, GhostButton, DockExpandButton, IconButton,
 import { TerminalView, TermSpan, TermMatch, FindStatus, QuickCmd, QuickDockPanel } from "terminal_view.slint";
 import { SftpEntry, SftpTreeNode, TunnelInfo } from "sftp_panel.slint";
 import { TerminalView, TermSpan, TermMatch, QuickCmd, QuickDockPanel } from "terminal_view.slint";
-import { SftpEntry, SftpTreeNode, SftpLocalPlace, TunnelInfo } from "sftp_panel.slint";
+import { SftpEntry, SftpTreeNode, SftpLocalPlace, TunnelInfo, SftpPathSuggestion, SftpPathSuggestions } from "sftp_panel.slint";
 import { ProcWindow, ProcRow } from "proc_window.slint";
 import { SystemInfoWindow, SysInfoRow, SysMetricRow, SysNetRow } from "system_info_window.slint";
 import { EditorWindow } from "editor_window.slint";
 import { EditorPane, EditorFindResult, EditorDoc } from "editor_pane.slint";
-import { InterfacePanel, OutputRuleItem, WslProfileInfo, CustomAgentInfo, UpdateMirrorRow, ColorThemeItem } from "interface_panel.slint";
+import { InterfacePanel, OutputRuleItem, WslProfileInfo, CustomAgentInfo, CustomShellInfo, CredentialInfo, UpdateMirrorRow, ColorThemeItem, TermSchemeItem } from "interface_panel.slint";
 // Re-export so `slint::include_modules!` generates the detached Rust window types.
 export { ProcWindow, SystemInfoWindow, EditorWindow }
 import { ComboBox, SpinBox, LineEdit, Button, ScrollView, CheckBox, Palette } from "std-widgets.slint";
 
-export { SessionInfo, LaunchItem, SessionDraft, JumpHop, TabInfo, SftpEntry, SftpTreeNode, TunnelInfo, QuickCmd, PortFwd, WslProfileInfo, CustomAgentInfo, UpdateMirrorRow, ThemePalette, ColorThemeItem }
+export { SessionInfo, LaunchItem, SessionDraft, JumpHop, TabInfo, SftpEntry, SftpTreeNode, TunnelInfo, QuickCmd, PortFwd, WslProfileInfo, CustomAgentInfo, CustomShellInfo, CredentialInfo, UpdateMirrorRow, ThemePalette, ColorThemeItem, TermColors, TermSchemeItem, SftpPathSuggestion, SftpPathSuggestions }
 
 // --- TerminalState ---------------------------------------------------------
 // Per-terminal view-model exposed to Rust. A TabInfo has the metadata; the
@@ -82,6 +82,10 @@ export struct TerminalState {
     // SFTP panel state
     sftp-path: string,
     sftp-entries: [SftpEntry],
+    // Unfiltered remote listing, kept so the name filter can be changed (or
+    // cleared) without another round trip to the server.
+    sftp-all-entries: [SftpEntry],
+    sftp-filter: string,        // remote name filter; "" = show everything
     sftp-status: string,
     sftp-loading: bool,
     sftp-tree-nodes: [SftpTreeNode],
@@ -112,6 +116,9 @@ export struct TerminalState {
     sftp-local-sort-dir: int,
     sftp-local-filter: string,
     sftp-local-all-entries: [SftpEntry],
+    // Path completion caches (see sftp_complete.rs): one per path-bar side.
+    sftp-suggest: SftpPathSuggestions,
+    sftp-local-suggest: SftpPathSuggestions,
     font-size: int,             // per-session zoom override in px (0 = follow window)
     tunnels: [TunnelInfo],      // runtime SSH tunnels (#206)
     sftp-collapsed: bool,       // SFTP panel minimised — per session (#v0.5)
@@ -575,7 +582,9 @@ export component AppWindow inherits Window {
     // just left of the three 46px window controls, so the tab row keeps its full
     // width and docked sidebars no longer shift them.
     property <length> toolbar-x-off:
-        root.custom-titlebar ? 3 * 46px + 4px : root.dock-right-gap + 4px;
+        // 16px gap before the window controls (like JetBrains IDEs) so the
+        // Settings gear isn't mistaken for / mis-clicked as Minimize.
+        root.custom-titlebar ? 3 * 46px + 16px : root.dock-right-gap + 4px;
     property <length> toolbar-y-off:
         root.custom-titlebar ? 0px : root.dock-top-gap;
     property <length> toolbar-y:
@@ -715,7 +724,7 @@ export component AppWindow inherits Window {
     in-out property <bool> term-font-bold <=> Theme.term-font-bold;
     in-out property <string> term-cursor-style: "block";
     in-out property <string> term-cursor-color-hex: root.dark-mode ? "#D4D4D4" : "#2D2D2F";
-    in-out property <color> term-cursor-color: Theme.term-fg;
+    in-out property <color> term-cursor-color: Theme.term-cursor;
     in-out property <bool> output-highlight-enabled: true;
     in-out property <bool> json-format-output: true;
     in-out property <string> output-highlight-preset: "log";
@@ -752,6 +761,23 @@ export component AppWindow inherits Window {
     callback set-color-theme(string);
     callback set-color-theme-custom(string) -> bool;
     callback set-immersive-colors(bool);
+    // Terminal colour schemes (Settings › Terminal colours): one for dark mode,
+    // one for light. Rust fills the Theme colours and the picker list.
+    in-out property <TermColors> term-colors-dark <=> Theme.term-colors-dark;
+    in-out property <TermColors> term-colors-light <=> Theme.term-colors-light;
+    in property <[TermSchemeItem]> term-schemes;      // filtered rows for the edited mode
+    in property <TermSchemeItem> term-scheme-preview; // the edited mode's scheme
+    in-out property <bool> term-scheme-slot-dark: true;
+    in-out property <string> term-scheme-query;
+    in-out property <string> term-scheme-dark-id: "default";
+    in-out property <string> term-scheme-light-id: "default";
+    in property <string> term-scheme-dark-name;
+    in property <string> term-scheme-light-name;
+    in-out property <string> term-scheme-status;
+    callback set-term-scheme(bool /* dark slot */, string /* id */);
+    callback term-scheme-filter(bool /* dark slot */, string /* query */);
+    callback import-term-scheme(bool /* dark slot */);
+    callback remove-term-scheme(string /* id */);
     in property <[string]> term-fonts;             // installed monospace families
     in-out property <bool> interface-open: false;  // Interface settings overlay
     // Interface card position (draggable by its title bar, clamped inside the
@@ -1048,6 +1074,11 @@ export component AppWindow inherits Window {
     // or command bar) and can be dragged to split like any other tab.
     in-out property <bool> editor-embedded: false;
     callback set-editor-embedded(bool);       // apply + persist
+    // Settings › SFTP › External editor (#553).
+    in-out property <string> external-editor;
+    in-out property <string> external-editor-args;
+    callback set-external-editor(string, string);
+    callback pick-external-editor();
     in property <[EditorDoc]> editor-docs;
     callback open-editor-tab(string /* owner tab */, string /* path */, string /* name */,
                              string /* content */, bool /* readonly */);
@@ -1076,6 +1107,31 @@ export component AppWindow inherits Window {
     callback add-custom-agent(string, string, string);
     callback remove-custom-agent(string);
     callback pick-agent-directory();
+    // Settings → Local shells (#533, #538): detected + user-defined shells.
+    in property <[CustomShellInfo]> custom-shells;
+    in property <string> detected-shells;
+    in-out property <string> shell-new-name;
+    in-out property <string> shell-new-program;
+    in-out property <string> shell-new-args;
+    in-out property <string> shell-new-directory;
+    callback add-custom-shell(string, string, string, string);
+    callback remove-custom-shell(string);
+    callback pick-shell-program();
+    callback pick-shell-directory();
+    // Settings → Credentials (#526): saved SSH logins shared by sessions.
+    in property <[CredentialInfo]> credentials;
+    in-out property <string> cred-edit-id;
+    in-out property <string> cred-new-name;
+    in-out property <string> cred-new-user;
+    in-out property <string> cred-new-auth: "password";
+    in-out property <string> cred-new-password;
+    in-out property <string> cred-new-key-path;
+    in-out property <string> cred-status;
+    callback save-credential(string, string, string, string, string, string);
+    callback edit-credential(string);
+    callback cancel-credential-edit();
+    callback remove-credential(string);
+    callback pick-credential-key();
     // Rebuild the launch menu, the "agents" group and the settings list.
     callback refresh-agent-launchers();
     // Settings page to show when the panel opens (see InterfacePanel).
@@ -1136,6 +1192,11 @@ export component AppWindow inherits Window {
     in-out property <string> dialog-key-path;
     in-out property <string> dialog-key-inline;
     in-out property <bool> dialog-key-inline-mode: false;
+    // Saved credentials for the SSH login picker (#526); row 0 = none.
+    in property <[string]> credential-choices;
+    in property <[string]> credential-ids;
+    in-out property <string> dialog-credential-id;
+    in-out property <int> dialog-credential-index: 0;
     in-out property <string> dialog-proxy-type: "none";  // "none" | "socks5" | "http"
     in-out property <string> dialog-proxy-hostport;
     in-out property <string> dialog-group;
@@ -1395,6 +1456,7 @@ export component AppWindow inherits Window {
     callback sftp-edit(string /* tab-id */, string /* path */);
     callback sftp-open-external(string /* tab-id */, string /* path */);
     callback sftp-edit-external(string /* tab-id */, string /* path */);
+    callback sftp-open-with(string /* tab-id */, string /* path */, bool /* edit */);
     callback sftp-sort-request(string /* tab-id */, string /* key */);
     callback sftp-clear-sort(string /* tab-id */);
     callback tunnel-add(string /* tab-id */, string /* name */, string /* kind */, string /* bind */, string /* bind-port */, string /* host */, string /* host-port */, bool /* save */, bool /* auto-start */);
@@ -1441,6 +1503,11 @@ export component AppWindow inherits Window {
     callback sftp-local-toggle-hidden(string /* tab-id */);
     callback sftp-local-sort(string /* tab-id */, string /* column */);
     callback sftp-local-set-filter(string /* tab-id */, string /* text */);
+    callback sftp-set-filter(string /* tab-id */, string /* text */);
+    // Path completion: the split-view / toolbar path fields ask Rust to list
+    // the folder being completed (remote through SFTP, local on a thread).
+    callback sftp-complete-path(string /* tab-id */, string /* text */);
+    callback sftp-local-complete-path(string /* tab-id */, string /* text */);
     callback sftp-local-remove-recent(string /* tab-id */, string /* path */);
     callback sftp-local-move-bookmark(string /* tab-id */, string /* path */, int /* delta */);
     callback sftp-local-reveal(string /* tab-id */);
@@ -2265,6 +2332,8 @@ export component AppWindow inherits Window {
                         active: term.id == root.active-tab-id;
                         // Fullscreen also hides the status strip (#495).
                         zen-mode: root.hide-panels;
+                        // Popup menus keep themselves inside the window (#553).
+                        window-width: root.width;
                         width: term.id == pane.active-id ? parent.width : 0px;
                         height: term.id == pane.active-id ? parent.height : 0px;
                         tab-id: term.id;
@@ -2305,6 +2374,9 @@ export component AppWindow inherits Window {
                         toggle-sftp-column(key) => { root.toggle-sftp-column(key); }
                         sftp-path: term.sftp-path;
                         sftp-entries: term.sftp-entries;
+                        sftp-filter: term.sftp-filter;
+                        sftp-suggestions: term.sftp-suggest.entries;
+                        sftp-local-suggestions: term.sftp-local-suggest.entries;
                         sftp-status: term.sftp-status;
                         sftp-loading: term.sftp-loading;
                         sftp-tree-nodes: term.sftp-tree-nodes;
@@ -2350,6 +2422,15 @@ export component AppWindow inherits Window {
                         }
                         sftp-local-set-filter(text) => {
                             root.sftp-local-set-filter(term.id, text);
+                        }
+                        sftp-set-filter(text) => {
+                            root.sftp-set-filter(term.id, text);
+                        }
+                        sftp-complete-path(text) => {
+                            root.sftp-complete-path(term.id, text);
+                        }
+                        sftp-local-complete-path(text) => {
+                            root.sftp-local-complete-path(term.id, text);
                         }
                         sftp-local-remove-recent(path) => {
                             root.sftp-local-remove-recent(term.id, path);
@@ -2463,6 +2544,7 @@ export component AppWindow inherits Window {
                         sftp-edit(path) => { root.sftp-edit(term.id, path); }
                         sftp-open-external(path) => { root.sftp-open-external(term.id, path); }
                         sftp-edit-external(path) => { root.sftp-edit-external(term.id, path); }
+                        sftp-open-with(path, edit) => { root.sftp-open-with(term.id, path, edit); }
                         sftp-sort-request(key) => { root.sftp-sort-request(term.id, key); }
                         sftp-clear-sort() => { root.sftp-clear-sort(term.id); }
                         tunnel-add(name, kind, bind, bind-port, host, host-port, save, auto-start) => {
@@ -4850,6 +4932,10 @@ export component AppWindow inherits Window {
         draft-key-path <=> root.dialog-key-path;
         draft-key-inline <=> root.dialog-key-inline;
         draft-key-inline-mode <=> root.dialog-key-inline-mode;
+        credential-choices: root.credential-choices;
+        credential-ids: root.credential-ids;
+        draft-credential-id <=> root.dialog-credential-id;
+        draft-credential-index <=> root.dialog-credential-index;
         draft-proxy-type <=> root.dialog-proxy-type;
         draft-proxy-hostport <=> root.dialog-proxy-hostport;
         draft-group <=> root.dialog-group;
@@ -5353,6 +5439,9 @@ export component AppWindow inherits Window {
                     ui-scale: root.ui-scale;
                     sftp-follow-cd <=> root.sftp-follow-cd;
                     editor-embedded <=> root.editor-embedded;
+                    external-editor <=> root.external-editor;
+                    external-editor-args <=> root.external-editor-args;
+                    is-mac: root.is-mac;
                     collapse-sidebar-default <=> root.collapse-sidebar-default;
                     collapse-sftp-default <=> root.collapse-sftp-default;
                     sync-upload-enabled <=> root.sync-upload-enabled;
@@ -5414,6 +5503,20 @@ export component AppWindow inherits Window {
                     agent-new-name <=> root.agent-new-name;
                     agent-new-command <=> root.agent-new-command;
                     agent-new-directory <=> root.agent-new-directory;
+                    custom-shells: root.custom-shells;
+                    detected-shells: root.detected-shells;
+                    shell-new-name <=> root.shell-new-name;
+                    shell-new-program <=> root.shell-new-program;
+                    shell-new-args <=> root.shell-new-args;
+                    shell-new-directory <=> root.shell-new-directory;
+                    credentials: root.credentials;
+                    cred-edit-id <=> root.cred-edit-id;
+                    cred-new-name <=> root.cred-new-name;
+                    cred-new-user <=> root.cred-new-user;
+                    cred-new-auth <=> root.cred-new-auth;
+                    cred-new-password <=> root.cred-new-password;
+                    cred-new-key-path <=> root.cred-new-key-path;
+                    cred-status <=> root.cred-status;
                     set-wallpaper(v) => { root.set-wallpaper(v); }
                     pick-wallpaper-file() => { root.pick-wallpaper-file(); }
                     color-themes: root.color-themes;
@@ -5423,6 +5526,19 @@ export component AppWindow inherits Window {
                     set-color-theme(id) => { root.set-color-theme(id); }
                     set-color-theme-custom(hex) => { root.set-color-theme-custom(hex) }
                     set-immersive-colors(v) => { root.set-immersive-colors(v); }
+                    term-schemes: root.term-schemes;
+                    term-scheme-preview: root.term-scheme-preview;
+                    term-scheme-slot-dark: root.term-scheme-slot-dark;
+                    term-scheme-query: root.term-scheme-query;
+                    term-scheme-dark-id: root.term-scheme-dark-id;
+                    term-scheme-light-id: root.term-scheme-light-id;
+                    term-scheme-dark-name: root.term-scheme-dark-name;
+                    term-scheme-light-name: root.term-scheme-light-name;
+                    term-scheme-status: root.term-scheme-status;
+                    set-term-scheme(slot, id) => { root.set-term-scheme(slot, id); }
+                    term-scheme-filter(slot, q) => { root.term-scheme-filter(slot, q); }
+                    import-term-scheme(slot) => { root.import-term-scheme(slot); }
+                    remove-term-scheme(id) => { root.remove-term-scheme(id); }
                     set-term-font(v) => { root.set-term-font(v); }
                     set-term-font-size(v) => { root.set-term-font-size(v); }
                     set-terminal-line-spacing(v) => { root.set-terminal-line-spacing(v); }
@@ -5448,6 +5564,8 @@ export component AppWindow inherits Window {
                     set-renderer-mode(v) => { root.set-renderer-mode(v); }
                     set-sftp-follow-cd(v) => { root.set-sftp-follow-cd(v); }
                     set-editor-embedded(v) => { root.set-editor-embedded(v); }
+                    set-external-editor(program, args) => { root.set-external-editor(program, args); }
+                    pick-external-editor => { root.pick-external-editor(); }
                     set-collapse-sidebar-default(v) => { root.set-collapse-sidebar-default(v); }
                     set-collapse-sftp-default(v) => { root.set-collapse-sftp-default(v); }
                     set-sync-upload-enabled(v) => { root.set-sync-upload-enabled(v); }
@@ -5485,6 +5603,17 @@ export component AppWindow inherits Window {
                     add-custom-agent(name, command, directory) => { root.add-custom-agent(name, command, directory); }
                     remove-custom-agent(id) => { root.remove-custom-agent(id); }
                     pick-agent-directory => { root.pick-agent-directory(); }
+                    add-custom-shell(name, program, args, directory) => { root.add-custom-shell(name, program, args, directory); }
+                    remove-custom-shell(id) => { root.remove-custom-shell(id); }
+                    pick-shell-program => { root.pick-shell-program(); }
+                    pick-shell-directory => { root.pick-shell-directory(); }
+                    save-credential(id, name, user, auth, password, key-path) => {
+                        root.save-credential(id, name, user, auth, password, key-path);
+                    }
+                    edit-credential(id) => { root.edit-credential(id); }
+                    cancel-credential-edit => { root.cancel-credential-edit(); }
+                    remove-credential(id) => { root.remove-credential(id); }
+                    pick-credential-key => { root.pick-credential-key(); }
                     persist-wallpaper-overlay(v) => { root.persist-wallpaper-overlay(v); }
                 }
             }

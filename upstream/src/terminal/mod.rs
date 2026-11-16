@@ -1,6 +1,8 @@
 #[path = "struct/state.rs"]
 mod state;
 
+#[path = "impls/args.rs"]
+pub(crate) mod args;
 #[path = "impls/input.rs"]
 mod input;
 #[path = "impls/json_output.rs"]
@@ -21,6 +23,8 @@ mod presentation;
 mod render;
 #[path = "impls/render_gate.rs"]
 mod render_gate;
+#[path = "impls/scheme.rs"]
+pub(crate) mod scheme;
 #[path = "impls/serial.rs"]
 pub(crate) mod serial;
 #[path = "impls/telnet.rs"]

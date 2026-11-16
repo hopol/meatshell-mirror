@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::{DockEdgeSer, OutputHighlightRule, QuickCommand, Secret, Session};
+use super::{Credential, DockEdgeSer, OutputHighlightRule, QuickCommand, Secret, Session};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WslProfile {
@@ -24,6 +24,21 @@ pub struct CustomAgent {
     pub id: String,
     pub name: String,
     pub command: String,
+    #[serde(default)]
+    pub directory: String,
+}
+
+/// A user-defined local shell (#538), e.g. nushell, MSYS2 zsh or fish. Unlike
+/// a custom agent, `program` is started directly as the tab's shell (no
+/// PowerShell around it), with `args` (one line, split like a command line)
+/// and an optional start `directory`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CustomShell {
+    pub id: String,
+    pub name: String,
+    pub program: String,
+    #[serde(default)]
+    pub args: String,
     #[serde(default)]
     pub directory: String,
 }
@@ -91,6 +106,10 @@ pub(crate) fn default_quick_panel_height() -> f32 {
 pub struct ConfigFile {
     #[serde(default)]
     pub sessions: Vec<Session>,
+    /// Saved SSH logins shared by sessions (#526). Secrets are encrypted at
+    /// rest like session passwords.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credentials: Vec<Credential>,
     /// User-managed WSL launch entries. An empty list keeps the implicit default
     /// WSL entry for backwards compatibility.
     #[serde(default)]
@@ -98,6 +117,9 @@ pub struct ConfigFile {
     /// User-defined agent launchers shown next to the detected ones (#427).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub custom_agents: Vec<CustomAgent>,
+    /// User-defined local shells listed with the built-in ones (#538).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub custom_shells: Vec<CustomShell>,
     /// Preset SFTP download directory. Empty = ask each time.
     #[serde(default)]
     pub download_dir: String,
@@ -205,6 +227,14 @@ pub struct ConfigFile {
     /// the detached editor window. Defaults to false (#494).
     #[serde(default)]
     pub editor_embedded: bool,
+    /// Program used by "Edit with external editor" (#553). Empty = the OS
+    /// default app for the file type, as before.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub external_editor: String,
+    /// Arguments for `external_editor`; `{file}` marks where the file goes,
+    /// otherwise it is appended last.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub external_editor_args: String,
     /// Hide auxiliary panels and edge strips so the terminal fills the window.
     #[serde(default)]
     pub zen_mode: bool,
@@ -339,6 +369,13 @@ pub struct ConfigFile {
     /// the interface or switches light/dark. Default false keeps them on.
     #[serde(default)]
     pub immersive_colors_disabled: bool,
+    /// Terminal colour scheme used in dark mode (Settings › Terminal colours).
+    /// Empty = the default MeatShell terminal colours.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub terminal_scheme_dark: String,
+    /// Terminal colour scheme used in light mode. Empty = default.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub terminal_scheme_light: String,
     /// Settings-panel font scale, percent (80–160). 0 = 100% default (v0.5).
     #[serde(default)]
     pub panel_font: u32,

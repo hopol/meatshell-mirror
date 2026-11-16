@@ -153,6 +153,9 @@ pub enum AuthMethod {
     #[serde(rename = "keyboard-interactive")]
     KeyboardInteractive,
     Key,
+    /// Keys held by a running SSH agent — Bitwarden, 1Password, KeePassXC,
+    /// the OpenSSH agent (#528). Nothing secret is stored in the session.
+    Agent,
 }
 
 impl AuthMethod {
@@ -161,6 +164,7 @@ impl AuthMethod {
             AuthMethod::Password => "password",
             AuthMethod::KeyboardInteractive => "keyboard-interactive",
             AuthMethod::Key => "key",
+            AuthMethod::Agent => "agent",
         }
     }
 
@@ -168,6 +172,7 @@ impl AuthMethod {
         match s {
             "keyboard-interactive" | "keyboard" | "interactive" => AuthMethod::KeyboardInteractive,
             "key" => AuthMethod::Key,
+            "agent" => AuthMethod::Agent,
             _ => AuthMethod::Password,
         }
     }
@@ -188,6 +193,12 @@ pub struct Session {
     pub private_key_path: String,
     #[serde(default)]
     pub private_key_inline: Secret,
+    /// Saved credential this SSH session logs in with (#526). When set, the
+    /// user / auth / password / key fields above mirror that credential: the
+    /// store fills them in on load and whenever the credential changes, and
+    /// leaves the secrets out of the session on disk. Empty = own login.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub credential_id: String,
     /// Optional outbound proxy, e.g. "socks5://127.0.0.1:1080" or
     /// "http://user:pass@host:8080". Empty = use $ALL_PROXY, else direct.
     #[serde(default)]
@@ -234,6 +245,14 @@ pub struct Session {
     /// sessions, so it is left out of the config file when empty.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub local_command: String,
+    /// Executable a generated local session starts directly as its shell,
+    /// with `local_args` — detected shells like PowerShell 7 / nushell / Git
+    /// Bash and user-defined ones (#533, #538). Empty = pick the program from
+    /// `host` (PowerShell, CMD, WSL, $SHELL). Never set on saved sessions.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub local_program: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_args: Vec<String>,
 
     // --- Serial-only fields (ignored unless kind == Serial) -----------------
     /// Serial device path, e.g. "COM3" (Windows) or "/dev/ttyUSB0" (Linux).
@@ -488,6 +507,7 @@ impl Session {
             password: Secret::default(),
             private_key_path: String::new(),
             private_key_inline: Secret::default(),
+            credential_id: String::new(),
             proxy: String::new(),
             jump_session_id: String::new(),
             jump_session_ids: Vec::new(),
@@ -499,6 +519,8 @@ impl Session {
             local_distribution: String::new(),
             local_working_dir: String::new(),
             local_command: String::new(),
+            local_program: String::new(),
+            local_args: Vec::new(),
             serial_port: String::new(),
             baud_rate: default_baud(),
             data_bits: default_data_bits(),

@@ -313,6 +313,12 @@ async fn run_local(
 }
 
 fn local_program(session: &Session) -> (String, Vec<String>) {
+    // Detected and user-defined shells (#533, #538) name their executable
+    // directly; everything else is picked by `host` below.
+    let program = session.local_program.trim();
+    if !program.is_empty() {
+        return (program.to_string(), session.local_args.clone());
+    }
     match session.host.as_str() {
         #[cfg(windows)]
         "cmd" => (
@@ -385,9 +391,22 @@ fn local_program(session: &Session) -> (String, Vec<String>) {
     }
 }
 
-#[cfg(windows)]
 const POWERSHELL_UTF8_SETUP: &str = "$utf8 = New-Object System.Text.UTF8Encoding $false; \
      [Console]::InputEncoding = $utf8; [Console]::OutputEncoding = $utf8; $OutputEncoding = $utf8";
+
+/// Arguments that start PowerShell 7 (`pwsh`) as an interactive tab shell
+/// with the same UTF-8 console setup as Windows PowerShell (#533).
+pub(crate) fn pwsh_shell_args() -> Vec<String> {
+    vec![
+        "-NoLogo".to_string(),
+        "-NoExit".to_string(),
+        "-Command".to_string(),
+        POWERSHELL_UTF8_SETUP.to_string(),
+    ]
+}
+
+/// Split a user-typed argument line (#538); shared with the headless build.
+pub(crate) use super::args::split_args;
 
 /// Host folder for a local shell to start in: blank means the default, and a
 /// leading `~` is the user's home folder.
@@ -570,6 +589,36 @@ mod start_directory_tests {
             start_directory("~name"),
             Some(std::path::PathBuf::from("~name"))
         );
+    }
+}
+
+#[cfg(test)]
+mod custom_shell_tests {
+    use super::{local_program, split_args};
+    use crate::config::Session;
+
+    #[test]
+    fn argument_lines_split_on_spaces_and_keep_quoted_groups() {
+        assert!(split_args("   ").is_empty());
+        assert_eq!(split_args("-l -i"), ["-l", "-i"]);
+        assert_eq!(
+            split_args(r#"--config "C:\My Files\config.nu" -e 'ls | first'"#),
+            ["--config", r"C:\My Files\config.nu", "-e", "ls | first"]
+        );
+        // Backslashes are literal (Windows paths), empty quotes are an argument.
+        assert_eq!(split_args(r#"C:\bin\x.exe """#), [r"C:\bin\x.exe", ""]);
+    }
+
+    #[test]
+    fn a_session_with_a_program_starts_it_directly() {
+        let mut session = Session::new_empty();
+        // `host` is only a label for these sessions and must not pick the shell.
+        session.host = "nu".to_string();
+        session.local_program = r"C:\Program Files\nu\bin\nu.exe".to_string();
+        session.local_args = vec!["-l".to_string()];
+        let (program, args) = local_program(&session);
+        assert_eq!(program, r"C:\Program Files\nu\bin\nu.exe");
+        assert_eq!(args, ["-l"]);
     }
 }
 
