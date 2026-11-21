@@ -1,5 +1,5 @@
-commit=902581eb6b68d52429e24ceba7c475baca858481
-timestamp=2026-11-16T09:15:19Z
+commit=3587bafef6a0388627ab2bca56c89d910937d396
+timestamp=2026-11-21T09:26:49Z
 upstream_url=https://github.com/yituorou/meatshell
 upstream_branch=main
-source_ref=v0.8.3
+source_ref=v0.8.3-12-g3587baf
