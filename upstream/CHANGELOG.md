@@ -5,12 +5,72 @@ All notable changes are documented here. 本文件记录所有重要变更。
 
 ## [Unreleased]
 
+## [0.8.5] - 2026-11-25
+
+- **设置搜索。** 设置侧栏顶部新增搜索框，可搜索所有页面的设置项：名称、说明、分组标题、页面名称以及下拉选项 / 按钮文字，中英文均可搜索，与界面语言无关；多个词同时匹配。输入时右侧显示结果列表，每条标注所在页面；点击结果或按回车打开第一条，会跳转到对应页面、滚动到该设置并短暂高亮。
+- **Search in Settings.** A search box at the top of the Settings sidebar finds any setting on any page by its name, description, section heading, page name or option / button text, in English or Chinese whatever the UI language; several words must all match. Results replace the page while you type, each tagged with its page; click one, or press Enter for the first, to jump to that page with the setting scrolled into view and briefly highlighted.
+
+- **壁纸显示模式：透明 / 毛玻璃。** 壁纸与主题 › 沉浸式 中新增“壁纸显示模式”。“透明”（默认）保持壁纸清晰，透过半透明面板显示；“毛玻璃”将整个窗口背后的壁纸模糊，并按浅色 / 深色主题叠加对应色调，亮色壁纸不再在面板间隙处刺眼。模糊副本在加载壁纸时一次生成（约 200 KB），不增加渲染开销；独立的编辑器、进程和系统信息窗口同样生效。
+- **Wallpaper display mode: Transparency / Frosted glass.** Wallpaper & theme › Immersive gains a "Wallpaper display mode". Transparency (the default) keeps the wallpaper sharp behind the translucent panels; Frosted glass blurs it behind the whole window and tints it light or dark to match the theme, so a bright wallpaper no longer glares between panels. The blurred copy is made once when the wallpaper loads (about 200 KB), so drawing costs nothing extra, and the detached editor, process and system info windows follow the mode too.
+
+- **底层遮罩不透明度。** 透明模式下新增“底层遮罩不透明度”滑块（0–80%，默认 40%）：在所有面板下方铺一层与主题背景同色、覆盖整个窗口的遮罩，面板保持原有透明度。调高可压住与主题不搭的壁纸，例如深色模式下的浅色壁纸。
+- **Backdrop layer opacity.** In Transparency mode a new "Backdrop layer opacity" slider (0–80%, default 40%) lays one layer in the theme's background colour under all panels, across the whole window, while the panels keep their own transparency. Raise it to tone down a wallpaper that clashes with the theme, such as a light wallpaper in dark mode.
+
+- **扁平面板布局（#584）。** 壁纸与主题 › 面板 中新增“扁平面板”开关：关闭时保持圆角悬浮卡片和卡片间距；开启后去掉圆角和间距，面板之间改用 1px 细线分隔，侧栏、终端和欢迎页都会随之调整。默认关闭。感谢 @zcz-09。
+- **Flat panel layout (#584).** A "Flat panels" switch in Wallpaper & theme › Panels: off keeps the rounded floating cards with gaps between them; on drops the rounding and gaps and divides the panels with 1px lines, across the sidebars, the terminal and the welcome page. Off by default. Thanks @zcz-09.
+
+- **文件夹上传 / 下载改为并发传输（#580）。** 传输文件夹时先列出全部文件，所有文件立即以“排队中”出现在传输面板，再最多 4 个同时传输，大量小文件的文件夹明显更快。每个文件可单独取消，单个文件失败不会中断其余文件，结束后汇总结果。感谢 @MyMaskKing。
+- **Folder uploads and downloads transfer files concurrently (#580).** A folder transfer now lists every file first, shows them all as queued rows in the transfer panel straight away, then moves up to 4 at a time, so folders full of small files finish much faster. Each file can be cancelled on its own, one failed file no longer stops the rest, and the results are summed up at the end. Thanks @MyMaskKing.
+
+- **右上角工具栏图标统一，不再有常亮的按下状态（#579）。** 设置、传输、主题、会话同步、命令栏、置顶、更新七个图标统一为 16px 和同一套中性色：深色模式下不再有孤立的琥珀色太阳图标，命令栏按钮也不会因为命令栏默认开启而一直显示成按下的灰块（隐藏时图标变暗）。悬停与弹窗打开改用淡强调色底，并带 120ms 过渡。感谢 @A-noble。
+- **macOS 上右上角图标不再偏高（#579）。** 有原生标题栏时，标签栏上方还留着悬浮卡片的 10px 内边距，之前只按标题栏高度计算，七个图标比标签栏中线高出 10px、压在标签栏上沿。现在按卡片内边距一起计算，图标与标签文字同一条中线，设置 / 传输弹窗也随之下移对齐。
+- **Consistent top-right toolbar icons, no permanently pressed button (#579).** The seven icons (settings, transfers, theme, session sync, command bar, pin, updates) now share one 16px size and one neutral colour: the lone amber sun is gone, and the command bar button no longer looks pressed just because the bar is on by default (its glyph dims while the bar is hidden). Hover and open-popup states use a faint accent wash with a 120ms fade. Thanks @A-noble.
+- **The top-right icons no longer sit too high on macOS (#579).** With a native title bar the tab strip is another 10px down — the floating-card inset above it — but the icons were placed from the title-bar height alone, so all seven rode 10px above the strip's centre line and crossed its top edge. They are now centred on the strip, and the Settings / Transfers popups follow them down.
+
+## [0.8.4] - 2026-11-22
+
+- **最近连接。** 欢迎页的会话列表上方显示最近连接过的会话；Home 以侧栏显示时，没有打开任何标签的主区域会显示最近连接列表，一键重连。每行显示会话类型、地址和相对时间（如“3 分钟前”），悬停出现 × 可单独移除，也可清空全部；最多保留 20 条。面板透明度跟随 壁纸与主题 中的面板不透明度。
+- **Recent connections.** The welcome page shows the sessions you connected to recently above the session list, and with Home shown as a sidebar the empty main area lists them, one click to reconnect. Each row shows the session type, address and a relative time ("3 min ago"); a × on hover removes one entry and Clear removes them all. Up to 20 are kept, and the panel follows the panel opacity set on the Wallpaper & theme page.
+
+- **SSH 支持 X11 转发（#565）。** 会话编辑窗口 › 高级 中可开启 X11 转发，远端图形程序会显示在本机的 X 服务器上（Windows 下如 VcXsrv、Xming）。可指定 `DISPLAY` 和 `.Xauthority` 文件，留空则使用环境变量。远端只拿到随机生成的假 cookie，本机真实的 X 授权信息不会发送给服务器。感谢 @nilxbit。
+- **X11 forwarding for SSH sessions (#565).** Turn it on in the session editor's Advanced section and remote graphical programs open on your local X server (VcXsrv or Xming on Windows). `DISPLAY` and the `.Xauthority` file can be set, or left blank to use the environment. The server only ever sees a random stand-in cookie; your real X credentials never leave this machine. Thanks @nilxbit.
+
+- **文件列表新增全选（#566）。** 远程列表和双栏本地列表的表头新增全选框：未选、部分选中显示横线、全部选中显示对勾，点击即可全选或取消全选，筛选时只作用于当前显示的文件。远程列表获得焦点时 Ctrl+A（macOS 为 Cmd+A）效果相同。之后下载、删除、上传、复制等批量操作都作用于选中的项目。
+- **Select all in the file lists (#566).** The remote list and the split view's local list have a select-all box in the column header: empty, a dash when some rows are checked, a tick when all are. A click checks every row, or clears them, and only the rows the filter shows count. Ctrl+A (Cmd+A on macOS) does the same when the remote list has focus. Download, delete, upload and copy then act on the checked items.
+
+- **连接后可自动收起 Home 侧栏（#573）。** 设置中开启“连接后自动收起 Home 侧栏”后，当前终端连接成功时会话列表自动收起，点击 Home 图标可再次展开。默认关闭。感谢 @chan-commits。
+- **Optionally collapse the Home sidebar after connecting (#573).** With "Auto-collapse Home after connecting" on in Settings, the session list collapses once the active terminal connects; click Home to expand it again. Off by default. Thanks @chan-commits.
+
+- **面板与终端改为悬浮卡片（#560）。** 停靠的面板和终端区域四周留出统一间距、带圆角，边界更清楚；分隔条只在悬停或拖动时显示。深色模式下卡片使用略亮的填充色（#2D3440），面板边缘不再与背景混在一起。
+- **Panels and the terminal are floating cards (#560).** Docked panels and the terminal area get one even gap and rounded corners, so their edges are clear; dividers only show on hover or while dragging. In dark mode the cards use a lighter fill (#2D3440) so panel edges no longer blend into the background.
+
+- **Ubuntu 26.04（Wayland）下从 dock 启动会多出一个图标。** 在默认的自动渲染器模式下，启动时不会预先创建 Slint 后端，于是 `set_xdg_app_id` 返回 `NoPlatform` 且错误被丢弃，窗口因此没有 Wayland `app_id`，GNOME 无法把它与已固定的 `meatshell.desktop` 关联，就在 dock 里新建了一个图标。现在启动时总是先创建后端再设置 app id，设置失败也会写进日志。感谢 @suinxinliulang。
+- **Extra dock icon when the app is started from the dock on Ubuntu 26.04 (Wayland).** In the default automatic renderer mode the Slint backend was not created before the app id was set, so `set_xdg_app_id` failed with `NoPlatform`, the error was discarded and every window was created without a Wayland `app_id`: GNOME could not match it to the pinned `meatshell.desktop` entry and added a second icon. The backend is now always created first and a failure to set the id is logged. Thanks @suinxinliulang.
+
 - **老旧服务器只支持 SHA-1 MAC 时握手失败。** SSH 与 SFTP 连接在 SHA-2 MAC 之后追加 `hmac-sha1-etm@openssh.com` 与 `hmac-sha1` 作为最后的回退，面向只提供 MD5 / SHA-1 MAC 的老旧交换机、NAS 等设备，它们此前会在密钥交换后报 “No common MAC algorithm”。现代 SHA-2 仍排在前面，服务器支持时不会降级；仅提供 `hmac-md5` 的设备仍无法连接（russh 没有 MD5 MAC）。
 - **Handshake failed when an old server only offered SHA-1 MACs.** SSH and SFTP connections now append `hmac-sha1-etm@openssh.com` and `hmac-sha1` after the SHA-2 MACs as last-resort fallbacks, so older switches, NAS boxes and network gear that advertise only MD5 / SHA-1 MACs no longer fail with "No common MAC algorithm" after key exchange. Modern SHA-2 stays first, so a server that supports it never downgrades. Devices offering only `hmac-md5` still cannot connect, because russh has no MD5 MAC.
 - **macOS 上 App Store 版 Bitwarden 的 SSH Agent 无法使用（#528）。** 新增 App Store 版（沙盒）Bitwarden 的套接字路径 `~/Library/Containers/com.bitwarden.desktop/Data/.bitwarden-ssh-agent.sock`。同时，能连接但没有任何密钥的 Agent 会被跳过并继续尝试下一个：macOS 下 `$SSH_AUTH_SOCK` 指向系统自带的 launchd Agent，它通常是空的，此前会挡住 Bitwarden 并报“SSH Agent 中没有密钥”。无需再手动设置 `SSH_AUTH_SOCK`。感谢 @BH2WFR 排查。
 - **Bitwarden's SSH agent from the Mac App Store was not found (#528).** meatshell now also looks for the sandboxed App Store build's socket at `~/Library/Containers/com.bitwarden.desktop/Data/.bitwarden-ssh-agent.sock`. An agent that answers but holds no keys is now skipped for the next one: on macOS `$SSH_AUTH_SOCK` is launchd's own agent, which is usually empty and used to hide Bitwarden with "The SSH agent has no keys". Setting `SSH_AUTH_SOCK` by hand is no longer needed. Thanks @BH2WFR for tracking it down.
 - **macOS 上 RDP 报“当前环境没有图形显示”而无法连接（#570）。** macOS 应用本来就没有 `DISPLAY` / `WAYLAND_DISPLAY`，此前一律被拦下。现在 macOS 优先使用 FreeRDP 3 的原生 SDL 客户端（`sdl-freerdp` / `sdl-freerdp3`，`brew install freerdp` 即自带），无需 XQuartz；只有 XQuartz 提供了 `DISPLAY` 时才会再尝试 X11 版 `xfreerdp`。Linux / BSD 不变。
 - **RDP failed on macOS with "no graphical display here" (#570).** A macOS app never has `DISPLAY` / `WAYLAND_DISPLAY`, so every connect was refused. macOS now uses FreeRDP 3's native SDL client first (`sdl-freerdp` / `sdl-freerdp3`, included in `brew install freerdp`), no XQuartz needed; the X11 `xfreerdp` is only tried when XQuartz provides `DISPLAY`. Linux and BSD are unchanged.
+
+- **修复在终端按 Ctrl+C 后 SFTP 面板跳回用户目录的问题（#577）。** 手动浏览 SFTP 面板后，在终端按 Ctrl+C 重绘的提示符会被当作一次目录上报，面板被拉回 shell 所在目录（如 `/root`）。现在 Ctrl+C 不再移动面板；执行命令或 `cd` 后仍会像以前一样跟随。
+- **Fix Ctrl+C in the terminal sending the SFTP panel back to the home folder (#577).** After browsing the SFTP panel by hand, the prompt redrawn by Ctrl+C counted as a new directory report and pulled the panel back to the shell's folder (such as `/root`). Ctrl+C no longer moves the panel; running a command or `cd` still makes it follow as before.
+
+- **修复一次拖入多个文件时，同名冲突逐个询问的问题（#572）。** 一次拖放的所有文件和文件夹现在只询问一次“替换 / 保留两份 / 取消”，选择适用于整批。
+- **Fix one name-conflict prompt per item when dropping several files at once (#572).** A drop of several files and folders now asks "replace / keep both / cancel" once, and the answer applies to the whole drop.
+
+- **修复 Windows 上在双栏之间拖动文件后界面像是卡死的问题（#575）。** 拖动结束时弹出的对话框会出现在窗口后面且不响应，现在等拖动完全结束后再打开，对话框会显示在最前面。
+- **Fix the window seeming frozen after dragging files between the split-view halves on Windows (#575).** The dialog opened as the drag ended came up behind the window and inactive; it now opens once the drag has fully finished, in front.
+
+- **修复清空回滚历史的程序（如 Grok CLI）中选区消失的问题（#560）。** 程序清空回滚历史时，仍在屏幕上的选区现在会保留。
+- **Fix the selection vanishing in programs that clear the scrollback, such as Grok CLI (#560).** A selection still on screen now survives the scrollback being cleared.
+
+- **跳板机下拉框可滚动、可搜索（#567）。** 会话较多时列表不再超出窗口，可按名称或主机筛选。感谢 @chan-commits。
+- **The jump host dropdown scrolls and can be searched (#567).** Long session lists no longer run off the window, and you can filter by name or host. Thanks @chan-commits.
+
+- **修复设置页和会话窗口底部内容被遮挡的问题。** 可滚动的设置页面和会话编辑窗口现在能完整滚动到底部。感谢 @nilxbit。
+- **Fix the bottom of scrollable settings pages and the session dialog being cut off.** They now scroll all the way to the end. Thanks @nilxbit.
 
 ## [0.8.3] - 2026-11-15
 

@@ -2,6 +2,18 @@
 
 use super::*;
 
+/// Return the Home sidebar to its icon strip once a connection has opened.
+pub(super) fn collapse_home_after_connect(window: &AppWindow) {
+    if window.get_auto_collapse_home()
+        && window.get_welcome_as_sidebar()
+        && !window.get_welcome_collapsed()
+    {
+        window.set_welcome_collapsed(true);
+        window.invoke_set_welcome_collapsed(true);
+        window.invoke_dock_layout_changed();
+    }
+}
+
 /// Resolve a session's configured SSH jump host to the saved session it points
 /// at, ignoring a missing / dangling / self reference (#211).
 pub(super) fn save_layout(
@@ -343,6 +355,7 @@ pub(super) fn refresh_dock_inner(
         w.set_dock_central_y(0.0);
         w.set_dock_central_w(cw);
         w.set_dock_central_h(ch);
+        set_central_insets(&w, [0.0; 4]);
         return;
     }
     let saved = dock_stacks.borrow().clone();
@@ -426,6 +439,34 @@ pub(super) fn refresh_dock_inner(
     w.set_dock_central_y(geom.central.y);
     w.set_dock_central_w(geom.central.w);
     w.set_dock_central_h(geom.central.h);
+    let edges: Vec<&str> = geom.panels.iter().map(|p| p.edge).collect();
+    set_central_insets(&w, central_insets(&edges, w.get_flat_panels()));
+}
+
+/// Gap around every floating card: the docked panels draw their card this far
+/// inside their own rect, and the central tab/terminal card keeps the same
+/// distance from the window edges (#560).
+pub(super) const CARD_GAP: f32 = 10.0;
+
+/// Insets of the central card inside the central rect, `[left, top, right,
+/// bottom]`. Next to a docked panel the panel's own inset already makes the
+/// gap, so that side gets none; toward a window edge (or a flush collapsed
+/// tool strip) it gets `CARD_GAP`. `edges` are the docked panels' edges.
+/// `flat` (the Settings › Wallpaper & theme panel style) removes the gap
+/// entirely: the central card then sits flush and its hairline is the divider.
+pub(super) fn central_insets(edges: &[&str], flat: bool) -> [f32; 4] {
+    let gap = if flat { 0.0 } else { CARD_GAP };
+    let gap_for = |edge: &str| if edges.contains(&edge) { 0.0 } else { gap };
+    [gap_for("left"), gap_for("top"), gap_for("right"), gap_for("bottom")]
+}
+
+/// Published to Slint, which places the card, and read back by the terminal
+/// hit tests, so both always agree on where the panes are.
+fn set_central_insets(w: &AppWindow, [left, top, right, bottom]: [f32; 4]) {
+    w.set_central_inset_left(left);
+    w.set_central_inset_top(top);
+    w.set_central_inset_right(right);
+    w.set_central_inset_bottom(bottom);
 }
 
 /// Hit-test a drag point (pane-area coords) to a target pane + drop zone, plus
@@ -594,5 +635,35 @@ pub(super) fn wire_pane_sftp_and_font_zoom(
         window.on_set_pane_sftp_saved_height(move |tab_id: SharedString, v: f32| {
             update_terminal_row(&terminals_model, &tab_id, |r| r.sftp_saved_height = v);
         });
+    }
+}
+
+#[cfg(test)]
+mod central_card_tests {
+    use super::{central_insets, CARD_GAP};
+
+    #[test]
+    fn the_central_card_is_flush_only_next_to_docked_panels() {
+        // Nothing docked: 10px from every window edge.
+        assert_eq!(central_insets(&[], false), [CARD_GAP; 4]);
+        // Session list on the left, resources on the right (two panels on the
+        // right are one edge): the panels' own insets make those gaps.
+        assert_eq!(
+            central_insets(&["left", "right", "right"], false),
+            [0.0, CARD_GAP, 0.0, CARD_GAP]
+        );
+        assert_eq!(
+            central_insets(&["bottom"], false),
+            [CARD_GAP, CARD_GAP, CARD_GAP, 0.0]
+        );
+    }
+
+    #[test]
+    fn flat_panels_leave_no_gap_anywhere() {
+        // Flat mode: the central card is flush with the window edges and the
+        // docked panels; the 1px hairlines do the separating.
+        assert_eq!(central_insets(&[], true), [0.0; 4]);
+        assert_eq!(central_insets(&["left", "right"], true), [0.0; 4]);
+        assert_eq!(central_insets(&["top", "bottom"], true), [0.0; 4]);
     }
 }

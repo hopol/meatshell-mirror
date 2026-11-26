@@ -33,12 +33,12 @@ import { ProcWindow, ProcRow } from "proc_window.slint";
 import { SystemInfoWindow, SysInfoRow, SysMetricRow, SysNetRow } from "system_info_window.slint";
 import { EditorWindow } from "editor_window.slint";
 import { EditorPane, EditorFindResult, EditorDoc } from "editor_pane.slint";
-import { InterfacePanel, OutputRuleItem, WslProfileInfo, CustomAgentInfo, CustomShellInfo, CredentialInfo, UpdateMirrorRow, ColorThemeItem, TermSchemeItem } from "interface_panel.slint";
+import { InterfacePanel, OutputRuleItem, WslProfileInfo, CustomAgentInfo, CustomShellInfo, CredentialInfo, UpdateMirrorRow, ColorThemeItem, TermSchemeItem, SettingsHit } from "interface_panel.slint";
 // Re-export so `slint::include_modules!` generates the detached Rust window types.
 export { ProcWindow, SystemInfoWindow, EditorWindow }
 import { ComboBox, SpinBox, LineEdit, Button, ScrollView, CheckBox, Palette } from "std-widgets.slint";
 
-export { SessionInfo, LaunchItem, SessionDraft, JumpHop, TabInfo, SftpEntry, SftpTreeNode, TunnelInfo, QuickCmd, PortFwd, WslProfileInfo, CustomAgentInfo, CustomShellInfo, CredentialInfo, UpdateMirrorRow, ThemePalette, ColorThemeItem, TermColors, TermSchemeItem, SftpPathSuggestion, SftpPathSuggestions }
+export { SessionInfo, LaunchItem, SessionDraft, JumpHop, TabInfo, SftpEntry, SftpTreeNode, TunnelInfo, QuickCmd, PortFwd, WslProfileInfo, CustomAgentInfo, CustomShellInfo, CredentialInfo, UpdateMirrorRow, ThemePalette, ColorThemeItem, TermColors, TermSchemeItem, SettingsHit, SftpPathSuggestion, SftpPathSuggestions }
 
 // --- TerminalState ---------------------------------------------------------
 // Per-terminal view-model exposed to Rust. A TabInfo has the metadata; the
@@ -211,6 +211,13 @@ component WinBtn inherits Rectangle {
 component IconBtn inherits Rectangle {
     in property <string> icon;
     in property <brush> icon-color: Theme.text-secondary;
+    // Toggled-on / popup-open buttons tint the glyph instead of keeping the
+    // caller's idle colour (#579), so "on" reads the same for every button.
+    in property <brush> active-icon-color: Theme.accent;
+    // One optical size for every toolbar glyph (#579). The old binding used
+    // Theme.fs-md (13–14px), which made the 26px buttons look mostly empty and
+    // left the icons visibly smaller than the tab titles next to them.
+    in property <length> icon-size: 16px;
     in property <string> tooltip;
     in property <bool> active;
     // `breathe=true` makes the button add a separate pulse layer underneath
@@ -245,11 +252,21 @@ component IconBtn inherits Rectangle {
     // Replaces the previous `ta.has-hover || root.active` branch of the
     // combined background expression so opening a popup no longer keeps the
     // animate background loop running (#breathing-light).
+    //
+    // Active is a faint accent wash rather than the old solid `bg-hover` fill
+    // (#579): the command bar is on by default, so a full grey square made the
+    // toolbar look like one permanently pressed button and drowned out the
+    // icons beside it. The accent tint stays legible next to the hover fill.
+    //
+    // The short fade keeps the cluster from flickering as the pointer sweeps
+    // across it (#579); 120ms is short enough that a click still feels instant.
     static-bg := Rectangle {
         x: 0px; y: 0px;
         width: 100%; height: 100%;
         border-radius: Theme.radius-sm;
-        background: ta.has-hover || root.active ? Theme.bg-hover : transparent;
+        background: ta.has-hover ? Theme.bg-hover
+            : (root.active ? Theme.accent.with-alpha(0.16) : transparent);
+        animate background { duration: 120ms; easing: ease-out; }
     }
 
     // Layer 2 — breathing pulse, only while `breathe=true`.
@@ -295,8 +312,8 @@ component IconBtn inherits Rectangle {
     Text {
         text: root.icon;
         font-family: "Material Icons";
-        color: root.icon-color;
-        font-size: Theme.fs-md;
+        color: root.active ? root.active-icon-color : root.icon-color;
+        font-size: root.icon-size;
         horizontal-alignment: center;
         vertical-alignment: center;
     }
@@ -590,11 +607,25 @@ export component AppWindow inherits Window {
         root.custom-titlebar ? 3 * 46px + 16px : root.dock-right-gap + 4px;
     property <length> toolbar-y-off:
         root.custom-titlebar ? 0px : root.dock-top-gap;
+    // Vertical placement: the icons must sit on the tab strip's centre line.
+    //
+    // Custom title bar (Windows/Linux): 38px bar, 26px button → 6px inset.
+    //
+    // Native title bar (macOS, #579): the tab strip is NOT directly under the
+    // 28px reserved title-bar strip — the central area is a floating card inset
+    // by `central-inset-top` (10px), so the strip really starts at
+    // titlebar-inset + 10. Centring on `titlebar-inset` alone left every icon
+    // 10px high, straddling the strip's top edge. The popups follow the same
+    // shift so they stay anchored under their buttons.
     property <length> toolbar-y:
-        (root.custom-titlebar ? 6px : 5px + root.titlebar-inset) + root.toolbar-y-off;
+        (root.custom-titlebar
+            ? 6px
+            : root.central-inset-top + 5px + root.titlebar-inset) + root.toolbar-y-off;
     // Top edge of the Settings / Transfers popups anchored under the icons.
     property <length> toolbar-popup-y:
-        (root.custom-titlebar ? 40px : 40px + root.titlebar-inset) + root.toolbar-y-off;
+        (root.custom-titlebar
+            ? 40px
+            : root.central-inset-top + 40px + root.titlebar-inset) + root.toolbar-y-off;
     in-out property <bool> about-open: false;     // centered About dialog
     callback open-repo();                          // open the project's GitHub page
     in-out property <bool> shortcuts-open: false; // centered keyboard-shortcuts dialog (#103)
@@ -747,12 +778,22 @@ export component AppWindow inherits Window {
     callback set-renderer-mode(string);                    // applies next launch (#280)
     // Wallpaper / immersive theming — Rust drives these from the wallpaper module.
     in-out property <image> wallpaper-img <=> Theme.wallpaper;
+    in-out property <image> wallpaper-blurred <=> Theme.wallpaper-blurred;
+    in-out property <bool> wallpaper-frost <=> Theme.wallpaper-frost;
+    callback set-wallpaper-frost(bool);            // toggle + persist frosted glass
     in-out property <bool> wallpaper-active <=> Theme.wallpaper-active;
     in-out property <color> wp-accent <=> Theme.wp-accent;
     in-out property <color> wp-tint <=> Theme.wp-tint;
     // User-adjustable wallpaper overlay opacity (0.30–1.00), persisted.
     in-out property <float> wallpaper-overlay <=> Theme.panel-alpha;
     callback persist-wallpaper-overlay(float);
+    // Panel layout style (Settings › Wallpaper & theme): rounded floating
+    // cards separated by gaps, or square panels divided by 1px lines.
+    in-out property <bool> flat-panels <=> Theme.flat-panels;
+    callback set-flat-panels(bool);
+    // Transparency mode: how much the gaps between panels are dimmed (0–0.8).
+    in-out property <float> wallpaper-gap-dim <=> Theme.gap-dim;
+    callback persist-wallpaper-gap-dim(float);
     // Colour theme presets + the immersive-colours switch (Settings ›
     // Wallpaper & theme). Rust fills the palettes from the chosen preset.
     in-out property <ThemePalette> theme-palette-dark <=> Theme.palette-dark;
@@ -764,6 +805,8 @@ export component AppWindow inherits Window {
     callback set-color-theme(string);
     callback set-color-theme-custom(string) -> bool;
     callback set-immersive-colors(bool);
+    // Settings search box (Rust: settings_search.rs).
+    callback search-settings(string /* query */, bool /* lang-en */) -> [SettingsHit];
     // Terminal colour schemes (Settings › Terminal colours): one for dark mode,
     // one for light. Rust fills the Theme colours and the picker list.
     in-out property <TermColors> term-colors-dark <=> Theme.term-colors-dark;
@@ -926,6 +969,8 @@ export component AppWindow inherits Window {
     // Welcome sidebar collapsed to the edge icon strip (IDEA-style), persisted.
     in-out property <bool> welcome-collapsed: false;
     callback set-welcome-collapsed(bool);          // apply + persist
+    in-out property <bool> auto-collapse-home: false;
+    callback set-auto-collapse-home(bool);
     in-out property <bool> collapse-sftp-default: false;
     callback set-collapse-sftp-default(bool);      // apply + persist
     in-out property <bool> sftp-collapsed: false;       // (legacy global; per-tab now)
@@ -1173,6 +1218,14 @@ export component AppWindow inherits Window {
     property <length> dock-right-gap: root.width - root.dock-central-x - root.dock-central-w;
     property <length> dock-top-gap: root.dock-central-y;
     property <length> dock-bottom-gap: root.height - root.dock-central-y - root.dock-central-h;
+    // The tab/terminal area is a floating card like the docked panels (#560):
+    // inset from the central rect toward window edges, flush where a docked
+    // panel's own inset already makes the gap. Set by Rust (panes.rs), which
+    // also uses them to hit-test the terminals.
+    in-out property <length> central-inset-left: 10px;
+    in-out property <length> central-inset-top: 10px;
+    in-out property <length> central-inset-right: 10px;
+    in-out property <length> central-inset-bottom: 10px;
     callback stack-split-drag(string /* edge */, int /* index */, float /* pos */);
     // Reports the real dock-area size (window minus title bar): the Rust dock
     // engine must measure in THIS frame, not the window frame, or every panel
@@ -1452,6 +1505,7 @@ export component AppWindow inherits Window {
     callback sftp-tree-expand(string /* tab-id */, string /* path */);
     callback sftp-delete(string /* tab-id */, string /* path */);
     callback sftp-toggle-select(string /* tab-id */, int /* row */);   // (#100)
+    callback sftp-check-all(string /* tab-id */, bool /* check */);    // (#566)
     callback sftp-select-range(string /* tab-id */, int /* from */, int /* to */); // Shift+click
     // SFTP path bookmarks + recent folders (#500), stored per session.
     callback sftp-record-visit(string /* tab-id */, string /* path */);
@@ -1495,6 +1549,7 @@ export component AppWindow inherits Window {
     callback sftp-local-refresh(string /* tab-id */);
     callback sftp-local-open(string /* tab-id */, string /* local-path */);  // OS default app
     callback sftp-local-toggle-select(string /* tab-id */, int /* row */);
+    callback sftp-local-check-all(string /* tab-id */, bool /* check */);
     callback sftp-local-select-range(string /* tab-id */, int /* from */, int /* to */);
     callback sftp-local-copy-path(string /* local-path */);
     callback sftp-local-upload(string /* tab-id */, string /* local-path */);
@@ -1572,8 +1627,16 @@ export component AppWindow inherits Window {
         x: 0; y: 0;
         width: parent.width;
         height: parent.height;
-        source: Theme.wallpaper;
+        source: Theme.wallpaper-backdrop;
         image-fit: cover;
+    }
+    // Light/dark wash over the wallpaper (blurred in frosted-glass mode; a
+    // fainter veil in transparency mode) — tames bright wallpapers in the gaps.
+    if Theme.wallpaper-active : Rectangle {
+        x: 0; y: 0;
+        width: parent.width;
+        height: parent.height;
+        background: Theme.frost-wash;
     }
 
     // Zen (focus) mode keyboard toggle — same persist path as the Settings
@@ -2189,6 +2252,17 @@ export component AppWindow inherits Window {
                 height: root.quick-panel-open && !root.quick-panel-collapsed && !parent.quick-horizontal
                     ? parent.height - parent.quick-h - parent.quick-sp : parent.height;
                 clip: true;
+                // The central card (#560): rounded and outlined like the docked
+                // panels' cards, the same 10px from the window edges, so every
+                // top edge lines up. Zen mode / terminal fullscreen keep the
+                // terminal edge to edge (Rust sets the insets to 0 there).
+                central-card := Rectangle {
+                    x: root.central-inset-left;
+                    y: root.central-inset-top;
+                    width: parent.width - root.central-inset-left - root.central-inset-right;
+                    height: parent.height - root.central-inset-top - root.central-inset-bottom;
+                    border-radius: root.hide-panels ? 0px : Theme.card-radius;
+                    clip: true;
                 // Split-pane area (v0.5): panes tile this rect; each pane has its own
                 // tab strip + active terminal / welcome. Rust flattens the split tree
                 // into `panes` for the size we report here.
@@ -2297,18 +2371,12 @@ export component AppWindow inherits Window {
                     }
 
                     // Welcome-sidebar layout with nothing open: recent
-                    // connections float over the wallpaper, centred in the
-                    // area and scaled with it (1.0 up to ~900×700, at most
-                    // 1.3× on large windows). A short area shows fewer rows.
+                    // connections fill the empty area, as many rows as fit.
                     if pane.tabs.length == 0 && root.welcome-as-sidebar
                         && root.recent-sessions.length > 0 : RecentsCard {
-                        property <length> margin: 24px;
-                        property <int> fit-rows: floor((parent.height - 2 * self.margin
-                            - self.chrome-height) / self.row-height);
-                        max-rows: max(1, min(6, self.fit-rows));
-                        width: min(400px, parent.width - 2 * self.margin);
-                        x: (parent.width - self.width) / 2;
-                        y: max(self.margin, (parent.height - self.height) / 2);
+                        width: parent.width;
+                        height: parent.height;
+                        max-rows: max(1, floor((parent.height - self.chrome-height) / self.row-height));
                         items: root.recent-sessions;
                         connect(id) => { root.connect-session(id); }
                         remove(id) => { root.remove-recent(id); }
@@ -2549,6 +2617,7 @@ export component AppWindow inherits Window {
                         sftp-refresh(path) => { root.sftp-refresh(term.id, path); }
                         sftp-tree-expand(path) => { root.sftp-tree-expand(term.id, path); }
                         sftp-toggle-select(i) => { root.sftp-toggle-select(term.id, i); }
+                        sftp-check-all(on) => { root.sftp-check-all(term.id, on); }
                         sftp-select-range(a, b) => { root.sftp-select-range(term.id, a, b); }
                         sftp-bookmarks: term.sftp-bookmarks;
                         sftp-recent: term.sftp-recent;
@@ -2608,6 +2677,7 @@ export component AppWindow inherits Window {
                         sftp-local-refresh() => { root.sftp-local-refresh(term.id); }
                         sftp-local-open(path) => { root.sftp-local-open(term.id, path); }
                         sftp-local-toggle-select(i) => { root.sftp-local-toggle-select(term.id, i); }
+                        sftp-local-check-all(on) => { root.sftp-local-check-all(term.id, on); }
                         sftp-local-select-range(a, b) => { root.sftp-local-select-range(term.id, a, b); }
                         sftp-local-copy-path(path) => { root.sftp-local-copy-path(path); }
                         sftp-local-upload(path) => { root.sftp-local-upload(term.id, path); }
@@ -2736,6 +2806,16 @@ export component AppWindow inherits Window {
                     border-radius: Theme.radius-sm;
                 }
                 }
+                // The card's hairline, drawn over the panes so a terminal's own
+                // background cannot cover it. Flat mode omits it: the docked
+                // panels draw their own 1px divider on the facing edge, which
+                // keeps multi-edge corners from doubling the line.
+                if !root.hide-panels && !Theme.flat-panels : Rectangle {
+                    border-radius: Theme.card-radius;
+                    border-width: 1px;
+                    border-color: Theme.border-subtle;
+                }
+                }
             }
 
             if false : QuickDockPanel {
@@ -2837,7 +2917,10 @@ export component AppWindow inherits Window {
                 width: gp.w;
                 height: gp.h;
                 clip: true;
-                background: Theme.bg-panel;
+                // No fill of its own: each panel draws a card inset 10px inside
+                // this rect, so the gaps around it show the window like the
+                // gaps around the central card (#560).
+                background: transparent;
 
                 if gp.kind == "sidebar" : Sidebar {
                     width: parent.width;
@@ -2942,8 +3025,13 @@ export component AppWindow inherits Window {
                     remove-session(id) => { root.remove-session(id); }
                 }
                 if gp.kind == "quick" : QuickDockPanel {
-                    width: parent.width;
-                    height: parent.height;
+                    // Inset card, like the resource and session panels (#560);
+                    // flat mode removes the gap and the rounding.
+                    x: Theme.card-gap;
+                    y: Theme.card-gap;
+                    width: parent.width - Theme.card-gap * 2;
+                    height: parent.height - Theme.card-gap * 2;
+                    border-radius: Theme.card-radius;
                     commands: root.quick-commands;
                     dock-edge: gp.edge;
                     activate(command, send-enter) => {
@@ -2974,6 +3062,18 @@ export component AppWindow inherits Window {
                         root.panel-dragging = false;
                     }
                 }
+                // Flat layout: one 1px line on the panel's central-facing edge.
+                // It replaces the rounded card's gap and, because panels on a
+                // later edge are drawn on top, also separates perpendicular
+                // neighbours (e.g. a top panel's full-width bottom line splits
+                // it from the left panel underneath its corner).
+                if Theme.flat-panels : Rectangle {
+                    x: gp.edge == "left" ? parent.width - 1px : 0px;
+                    y: gp.edge == "top" ? parent.height - 1px : 0px;
+                    width: gp.edge == "left" || gp.edge == "right" ? 1px : parent.width;
+                    height: gp.edge == "left" || gp.edge == "right" ? parent.height : 1px;
+                    background: Theme.border-subtle;
+                }
                 // Drag the panel's in-edge (central-facing) edge to resize its
                 // extent along the dock normal (width on left/right, height on
                 // top/bottom) — the stacked renderer's replacement for the old
@@ -2985,7 +3085,8 @@ export component AppWindow inherits Window {
                     // half of the grab area and leave a 2px target.
                     x: parent.width - 4px; y: 0px;
                     width: 4px; height: parent.height;
-                    background: rr-l.has-hover ? Theme.accent : Theme.border-subtle;
+                    // Invisible until hovered: the 10px gap is the separation (#560).
+                    background: rr-l.has-hover || rr-l.pressed ? Theme.accent : transparent;
                     rr-l := TouchArea {
                         mouse-cursor: ew-resize;
                         moved => {
@@ -3000,7 +3101,8 @@ export component AppWindow inherits Window {
                 if gp.edge == "right" : Rectangle {
                     x: 0px; y: 0px;
                     width: 4px; height: parent.height;
-                    background: rr-r.has-hover ? Theme.accent : Theme.border-subtle;
+                    // Invisible until hovered: the 10px gap is the separation (#560).
+                    background: rr-r.has-hover || rr-r.pressed ? Theme.accent : transparent;
                     rr-r := TouchArea {
                         mouse-cursor: ew-resize;
                         moved => {
@@ -3017,7 +3119,8 @@ export component AppWindow inherits Window {
                     // Same reasoning as the left edge: keep the whole 4px inside.
                     x: 0px; y: parent.height - 4px;
                     width: parent.width; height: 4px;
-                    background: rr-t.has-hover ? Theme.accent : Theme.border-subtle;
+                    // Invisible until hovered: the 10px gap is the separation (#560).
+                    background: rr-t.has-hover || rr-t.pressed ? Theme.accent : transparent;
                     rr-t := TouchArea {
                         mouse-cursor: ns-resize;
                         moved => {
@@ -3032,7 +3135,8 @@ export component AppWindow inherits Window {
                 if gp.edge == "bottom" : Rectangle {
                     x: 0px; y: 0px;
                     width: parent.width; height: 4px;
-                    background: rr-b.has-hover ? Theme.accent : Theme.border-subtle;
+                    // Invisible until hovered: the 10px gap is the separation (#560).
+                    background: rr-b.has-hover || rr-b.pressed ? Theme.accent : transparent;
                     rr-b := TouchArea {
                         mouse-cursor: ns-resize;
                         moved => {
@@ -3053,8 +3157,22 @@ export component AppWindow inherits Window {
                 y: dd.y;
                 width: dd.w;
                 height: dd.h;
-                background: dd-ta.pressed ? Theme.accent : Theme.border-strong;
+                // Flat mode: the 4px grab band is filled with the card surface
+                // and carries a single 1px line down its middle, so two flush
+                // panels read as one surface split by a divider. Hover / drag
+                // feedback still tints the band like the card layout.
+                background: dd-ta.pressed
+                    ? Theme.accent
+                    : (dd-ta.has-hover ? Theme.border-strong
+                        : (Theme.flat-panels ? Theme.card-bg : transparent));
                 animate background { duration: 100ms; }
+                if Theme.flat-panels : Rectangle {
+                    x: dd.vertical ? 0px : parent.width / 2;
+                    y: dd.vertical ? parent.height / 2 : 0px;
+                    width: dd.vertical ? parent.width : 1px;
+                    height: dd.vertical ? 1px : parent.height;
+                    background: Theme.border-subtle;
+                }
                 dd-ta := TouchArea {
                     mouse-cursor: dd.vertical ? ns-resize : ew-resize;
                     moved => {
@@ -3115,6 +3233,14 @@ export component AppWindow inherits Window {
                     border-color: Theme.accent;
                 }
             }
+
+            // Flat layout: one hairline between the window chrome above and
+            // whatever starts the dock area (a top panel, or the tab strip).
+            if Theme.flat-panels : Rectangle {
+                x: 0px; y: 0px;
+                width: parent.width; height: 1px;
+                background: Theme.border-subtle;
+            }
         }
         }
     }
@@ -3150,7 +3276,9 @@ export component AppWindow inherits Window {
         x: root.width - 94px - root.toolbar-x-off; y: root.toolbar-y;
         visible: !root.term-fullscreen;
         icon: Theme.dark ? "\u{E518}" : "\u{E51C}";
-        icon-color: Theme.dark ? #f5c542 : #5856d6;
+        // Neutral like its neighbours (#579): the amber sun / indigo moon were
+        // the only decorative colours in the row, so the cluster read as a mix
+        // of unrelated icons. Sun vs moon already says which theme is active.
         tooltip: root.lang-en ? "Toggle theme" : "切换主题";
         clicked => { root.toggle-theme(); }
     }
@@ -3158,7 +3286,6 @@ export component AppWindow inherits Window {
         x: root.width - 124px - root.toolbar-x-off; y: root.toolbar-y;
         visible: !root.term-fullscreen;
         icon: "\u{E627}";
-        icon-color: root.sync-input ? Theme.accent : Theme.text-secondary;
         active: root.sync-input;
         tooltip: root.lang-en
             ? (root.sync-input ? "Sync input: ON" : "Sync input")
@@ -3169,7 +3296,10 @@ export component AppWindow inherits Window {
         x: root.width - 154px - root.toolbar-x-off; y: root.toolbar-y;
         visible: !root.term-fullscreen;
         icon: "\u{E86F}";   // Material "code" — command bar
-        active: !root.cmd-bar-hidden;
+        // No permanent `active`: the command bar is shown by default, so an
+        // always-on highlight looked like a stuck pressed state in the idle
+        // toolbar (#579). Dim the glyph while the bar is hidden instead.
+        icon-color: root.cmd-bar-hidden ? Theme.text-muted : Theme.text-secondary;
         tooltip: root.lang-en
             ? (root.cmd-bar-hidden ? "Show command bar" : "Hide command bar")
             : (root.cmd-bar-hidden ? "显示命令栏" : "隐藏命令栏");
@@ -3179,7 +3309,6 @@ export component AppWindow inherits Window {
         x: root.width - 184px - root.toolbar-x-off; y: root.toolbar-y;
         visible: !root.term-fullscreen;
         icon: "\u{F10D}";   // Material "push_pin" — always on top (#450)
-        icon-color: root.pinned ? Theme.accent : Theme.text-secondary;
         active: root.pinned;
         tooltip: root.lang-en
             ? (root.pinned ? "Unpin window (stop keeping on top)" : "Pin window (keep on top)")
@@ -3403,10 +3532,12 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                Flickable {
+                // ScrollView (not a bare Flickable) so the transfer history
+                // gets a visible scrollbar once the rows exceed the popup
+                // height — matches every other scrolling list in the app.
+                ScrollView {
                     vertical-stretch: 1;
-                    content-width: self.width;
-                    content-height: max(self.height, xfer-col.preferred-height);
+                    content-width: self.visible-width;
                     xfer-col := VerticalLayout {
                         alignment: start;
                         spacing: 4px;
@@ -5482,6 +5613,8 @@ export component AppWindow inherits Window {
                     external-editor-args <=> root.external-editor-args;
                     is-mac: root.is-mac;
                     collapse-sidebar-default <=> root.collapse-sidebar-default;
+                    auto-collapse-home <=> root.auto-collapse-home;
+                    set-auto-collapse-home(v) => { root.set-auto-collapse-home(v); }
                     collapse-sftp-default <=> root.collapse-sftp-default;
                     sync-upload-enabled <=> root.sync-upload-enabled;
                     webdav-enabled <=> root.webdav-enabled;
@@ -5533,6 +5666,9 @@ export component AppWindow inherits Window {
                     mcp-config-json: root.mcp-config-json;
                     copy-text(t) => { root.copy-text(t); }
                     wallpaper-overlay <=> root.wallpaper-overlay;
+                    flat-panels: root.flat-panels;
+                    set-flat-panels(v) => { root.set-flat-panels(v); }
+                    wallpaper-gap-dim <=> root.wallpaper-gap-dim;
                     current-wallpaper: root.current-wallpaper;
                     custom-wallpaper-name: root.custom-wallpaper-name;
                     wsl-profiles: root.wsl-profiles;
@@ -5565,6 +5701,9 @@ export component AppWindow inherits Window {
                     set-color-theme(id) => { root.set-color-theme(id); }
                     set-color-theme-custom(hex) => { root.set-color-theme-custom(hex) }
                     set-immersive-colors(v) => { root.set-immersive-colors(v); }
+                    search-settings(q, en) => { root.search-settings(q, en) }
+                    wallpaper-frost: root.wallpaper-frost;
+                    set-wallpaper-frost(v) => { root.set-wallpaper-frost(v); }
                     term-schemes: root.term-schemes;
                     term-scheme-preview: root.term-scheme-preview;
                     term-scheme-slot-dark: root.term-scheme-slot-dark;
@@ -5654,6 +5793,7 @@ export component AppWindow inherits Window {
                     remove-credential(id) => { root.remove-credential(id); }
                     pick-credential-key => { root.pick-credential-key(); }
                     persist-wallpaper-overlay(v) => { root.persist-wallpaper-overlay(v); }
+                    persist-wallpaper-gap-dim(v) => { root.persist-wallpaper-gap-dim(v); }
                 }
             }
             Rectangle {

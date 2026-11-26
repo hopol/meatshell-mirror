@@ -485,7 +485,9 @@ export component Sidebar inherits Rectangle {
       : "\u{E5CB}";                               // chevron_left (left, default)
 
     width: 220px;
-    background: Theme.bg-panel;
+    // The panel's card is inset 10px below; the gap around it shows the
+    // window, like the gaps around the central card (#560).
+    background: transparent;
     border-width: 0;
 
     // Drag from any empty area of the panel to re-dock it (the status header is
@@ -512,13 +514,13 @@ export component Sidebar inherits Rectangle {
 
     // --- Vertical stack (docked left/right) --------------------------------
     if !root.lay-horizontal : Rectangle {
-        x: 10px;
-        y: 10px;
-        width: parent.width - 20px;
-        height: parent.height - 20px;
-        background: Theme.bg-panel;
-        border-radius: Theme.radius-md;
-        border-width: 1px;
+        x: Theme.card-gap;
+        y: Theme.card-gap;
+        width: parent.width - Theme.card-gap * 2;
+        height: parent.height - Theme.card-gap * 2;
+        background: Theme.card-bg;
+        border-radius: Theme.card-radius;
+        border-width: Theme.flat-panels ? 0px : 1px;
         border-color: Theme.border-subtle;
         clip: true;
 
@@ -563,13 +565,13 @@ export component Sidebar inherits Rectangle {
 
     // --- Horizontal row (docked top/bottom) --------------------------------
     if root.lay-horizontal : Rectangle {
-        x: 10px;
-        y: 10px;
-        width: parent.width - 20px;
-        height: parent.height - 20px;
-        background: Theme.bg-panel;
-        border-radius: Theme.radius-md;
-        border-width: 1px;
+        x: Theme.card-gap;
+        y: Theme.card-gap;
+        width: parent.width - Theme.card-gap * 2;
+        height: parent.height - Theme.card-gap * 2;
+        background: Theme.card-bg;
+        border-radius: Theme.card-radius;
+        border-width: Theme.flat-panels ? 0px : 1px;
         border-color: Theme.border-subtle;
         clip: true;
 

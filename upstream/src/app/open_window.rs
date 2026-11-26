@@ -183,6 +183,7 @@ pub(super) fn open_window(
     wire_ui_scale_and_wallpaper(&ctx);
     super::color_theme::wire(&ctx);
     super::terminal_scheme::wire(&ctx);
+    super::settings_search::wire(&window);
 
     let sessions_model: Rc<VecModel<SessionInfo>> = Rc::new(VecModel::default());
     window.set_sessions(ModelRc::from(sessions_model.clone()));
@@ -497,6 +498,8 @@ pub(super) fn open_window(
     // so closing the window stops them instead of leaking.
     let window_timers: Rc<RefCell<Vec<slint::Timer>>> = Rc::new(RefCell::new(Vec::new()));
     let transfer_speeds = super::transfer_speeds::TransferSpeeds::new(&window);
+    let transfer_row_index: Rc<RefCell<HashMap<String, usize>>> =
+        Rc::new(RefCell::new(HashMap::new()));
 
     // Expose this window's state to the rest of the process so tabs can be
     // dragged out into a new window or merged into another one (#tab-detach).
@@ -522,6 +525,7 @@ pub(super) fn open_window(
             splitters_model: splitters_model.clone(),
             timers: window_timers.clone(),
             transfer_speeds: transfer_speeds.clone(),
+            transfer_row_index: transfer_row_index.clone(),
             content_size: content_size.clone(),
             proc_win: proc_win.clone(),
             sys_win: sys_win.clone(),
@@ -668,8 +672,10 @@ pub(super) fn open_window(
     window.set_transfers(ModelRc::from(transfers_model.clone()));
     {
         let tm = transfers_model.clone();
+        let row_index = transfer_row_index.clone();
         window.on_clear_transfers(move || {
             transfer_speeds.clear();
+            row_index.borrow_mut().clear();
             tm.set_vec(Vec::<TransferInfo>::new());
         });
     }
